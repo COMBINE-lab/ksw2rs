@@ -105,46 +105,49 @@ pub struct Extz2Input<'a> {
 ///
 /// Reusing one workspace across many alignments avoids repeated heap
 /// allocations and improves short/medium input throughput.
+///
+/// The seven byte-sized DP arrays (u, v, x, y, s, sf, qr) are packed into a
+/// single contiguous allocation (`buf`) in the same layout that the C reference
+/// uses: `[u | v | x | y | s | sf | qr+16_pad]`.  This gives better cache and
+/// TLB behaviour than seven separate `Vec` allocations, and the 16-byte
+/// overshoot beyond `qr` means the SIMD score-fill kernels never need a
+/// per-chunk bounds check.
 #[derive(Debug, Default, Clone)]
 pub struct Workspace {
-    u: Vec<u8>,
-    v: Vec<u8>,
-    x: Vec<u8>,
-    y: Vec<u8>,
-    s: Vec<i8>,
-    sf: Vec<u8>,
-    qr: Vec<u8>,
+    /// Flat buffer: `6 * tlen_pad + qlen_pad + 16` bytes, zeroed on resize.
+    buf: Vec<u8>,
     h: Vec<i32>,
     off: Vec<i32>,
     off_end: Vec<i32>,
     p: Vec<u8>,
+    /// Cached layout dimensions set by the most recent `prepare_*` call.
+    tlen_pad: usize,
+    qlen_pad: usize,
 }
 
 impl Workspace {
+    /// Prepare the flat buffer for a score-only alignment.
+    ///
+    /// Layout: `[u | v | x | y | s | sf | qr+16]`, all zero-initialised once.
+    /// The trailing 16-byte pad on `qr` (and the implicit pad provided by `qr`
+    /// after `sf`) means SIMD score-fill kernels can always load 16 bytes
+    /// without a per-chunk bounds check.
     #[inline]
-    fn prepare_score_only(&mut self, qlen: usize, tlen: usize, approx: bool) -> (usize, usize) {
+    fn prepare_score_only(&mut self, qlen: usize, tlen: usize, approx: bool) {
         let tlen_pad = tlen.div_ceil(16) * 16;
         let qlen_pad = qlen.div_ceil(16) * 16;
-        self.u.resize(tlen_pad, 0);
-        self.v.resize(tlen_pad, 0);
-        self.x.resize(tlen_pad, 0);
-        self.y.resize(tlen_pad, 0);
-        self.s.resize(tlen_pad, 0);
-        self.sf.resize(tlen_pad, 0);
-        self.qr.resize(qlen_pad, 0);
-        self.u[..tlen_pad].fill(0);
-        self.v[..tlen_pad].fill(0);
-        self.x[..tlen_pad].fill(0);
-        self.y[..tlen_pad].fill(0);
-        self.sf[..tlen_pad].fill(0);
-        self.qr[..qlen_pad].fill(0);
+        // 6 tlen_pad-wide arrays (u,v,x,y,s,sf) plus qr with a 16-byte pad.
+        let total = 6 * tlen_pad + qlen_pad + 16;
+        self.buf.clear();
+        self.buf.resize(total, 0u8);
+        self.tlen_pad = tlen_pad;
+        self.qlen_pad = qlen_pad;
         if !approx {
+            self.h.clear();
             self.h.resize(tlen, KSW_NEG_INF);
-            self.h[..tlen].fill(KSW_NEG_INF);
         } else {
             self.h.clear();
         }
-        (tlen_pad, qlen_pad)
     }
 
     #[inline]
@@ -155,8 +158,8 @@ impl Workspace {
         approx: bool,
         rows: usize,
         n_col: usize,
-    ) -> (usize, usize) {
-        let (tlen_pad, qlen_pad) = self.prepare_score_only(qlen, tlen, approx);
+    ) {
+        self.prepare_score_only(qlen, tlen, approx);
         self.off.resize(rows, 0);
         self.off_end.resize(rows, 0);
         let p_len = rows * n_col;
@@ -166,7 +169,6 @@ impl Workspace {
         }
         // SAFETY: readers only access row spans written by DP row kernels.
         unsafe { self.p.set_len(p_len) };
-        (tlen_pad, qlen_pad)
     }
 }
 

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use ksw2rs::{Extz, Extz2Input, KSW_EZ_SCORE_ONLY, extz2};
+use ksw2rs::{Extz, Extz2Input, KSW_EZ_SCORE_ONLY, Workspace, extz2_with_workspace};
 
 #[cfg(has_c_ref)]
 #[repr(C)]
@@ -89,7 +89,8 @@ fn encode_dna5(seq: &str) -> Vec<u8> {
 
 fn run_rust(input: &Extz2Input<'_>) -> Extz {
     let mut ez = Extz::default();
-    extz2(input, &mut ez);
+    let mut ws = Workspace::default();
+    extz2_with_workspace(input, &mut ez, &mut ws);
     ez
 }
 
@@ -118,12 +119,14 @@ fn run_c(input: &Extz2Input<'_>) -> CRefExtz {
 }
 
 fn bench_rust(input: &Extz2Input<'_>, iters: usize) -> f64 {
+    let mut ez = Extz::default();
+    let mut ws = Workspace::default();
     for _ in 0..5 {
-        let _ = run_rust(input);
+        extz2_with_workspace(input, &mut ez, &mut ws);
     }
     let t0 = Instant::now();
     for _ in 0..iters {
-        let _ = run_rust(input);
+        extz2_with_workspace(input, &mut ez, &mut ws);
     }
     t0.elapsed().as_secs_f64() * 1e6 / iters as f64
 }

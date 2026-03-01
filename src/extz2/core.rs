@@ -118,33 +118,24 @@ fn fill_scores_fast_row_scalar(
     qrr_base: i32,
     st0: usize,
     en0: usize,
-    tlen_pad: usize,
     wildcard: u8,
     sc_mch: i8,
     sc_mis: i8,
     sc_n: i8,
     s: &mut [i8],
 ) {
-    let mut t = st0;
-    while t <= en0 {
-        let t_end = (t + 16).min(tlen_pad);
-        for idx in t..t_end {
-            let sq = sf[idx];
-            let qidx = qrr_base + idx as i32;
-            let qq = if qidx >= 0 && (qidx as usize) < qr.len() {
-                qr[qidx as usize]
-            } else {
-                0
-            };
-            s[idx] = if sq == wildcard || qq == wildcard {
-                sc_n
-            } else if sq == qq {
-                sc_mch
-            } else {
-                sc_mis
-            };
-        }
-        t += 16;
+    for idx in st0..=en0 {
+        let sq = sf[idx];
+        let qidx = qrr_base + idx as i32;
+        // qpos >= 0 is guaranteed for idx in [st0, en0]; the cast is safe.
+        let qq = qr[qidx as usize];
+        s[idx] = if sq == wildcard || qq == wildcard {
+            sc_n
+        } else if sq == qq {
+            sc_mch
+        } else {
+            sc_mis
+        };
     }
 }
 
@@ -156,7 +147,7 @@ unsafe fn fill_scores_fast_row_avx2(
     qrr_base: i32,
     st0: usize,
     en0: usize,
-    tlen_pad: usize,
+    _tlen_pad: usize,
     wildcard: u8,
     sc_mch: i8,
     sc_mis: i8,
@@ -170,41 +161,38 @@ unsafe fn fill_scores_fast_row_avx2(
     let mis = _mm256_set1_epi8(sc_mis);
     let nsc = _mm256_set1_epi8(sc_n);
 
+    // The flat Workspace buffer guarantees sf is followed by at least 16 bytes
+    // of qr, and qr has a 16-byte trailing pad, so SIMD loads are always safe
+    // for t in [st0, en0].  qpos >= 0 is analytically guaranteed for valid t.
     let mut t = st0;
+    while t + 32 <= en0 + 1 {
+        let qpos = (qrr_base + t as i32) as usize;
+        // SAFETY: flat buffer layout ensures sf[t..t+31] and qr[qpos..qpos+31] are in-bounds.
+        let sq = unsafe { _mm256_loadu_si256(sf.as_ptr().add(t) as *const __m256i) };
+        let qq = unsafe { _mm256_loadu_si256(qr.as_ptr().add(qpos) as *const __m256i) };
+        let mask_wc = _mm256_or_si256(_mm256_cmpeq_epi8(sq, wc), _mm256_cmpeq_epi8(qq, wc));
+        let eq = _mm256_cmpeq_epi8(sq, qq);
+        let mut tmp = _mm256_blendv_epi8(mis, mch, eq);
+        tmp = _mm256_blendv_epi8(tmp, nsc, mask_wc);
+        // SAFETY: s has tlen_pad bytes; t+31 <= en0+30 < tlen_pad+31, sf overshoot reads into qr pad.
+        unsafe { _mm256_storeu_si256(s.as_mut_ptr().add(t) as *mut __m256i, tmp) };
+        t += 32;
+    }
+    // Handle the tail (0, 1, or 2 remaining 16-byte chunks) with SSE.
+    let sse_wc = _mm_set1_epi8(wildcard as i8);
+    let sse_mch = _mm_set1_epi8(sc_mch);
+    let sse_mis = _mm_set1_epi8(sc_mis);
+    let sse_nsc = _mm_set1_epi8(sc_n);
     while t <= en0 {
-        let qpos = qrr_base + t as i32;
-        let can_vec = t + 32 <= tlen_pad && qpos >= 0 && (qpos as usize + 32) <= qr.len();
-        if can_vec {
-            // SAFETY: guarded by `can_vec` bounds checks; unaligned access is allowed.
-            let sq = unsafe { _mm256_loadu_si256(sf.as_ptr().add(t) as *const __m256i) };
-            // SAFETY: guarded by `can_vec` bounds checks; unaligned access is allowed.
-            let qq = unsafe { _mm256_loadu_si256(qr.as_ptr().add(qpos as usize) as *const __m256i) };
-            let mask_wc = _mm256_or_si256(_mm256_cmpeq_epi8(sq, wc), _mm256_cmpeq_epi8(qq, wc));
-            let eq = _mm256_cmpeq_epi8(sq, qq);
-            let mut tmp = _mm256_blendv_epi8(mis, mch, eq);
-            tmp = _mm256_blendv_epi8(tmp, nsc, mask_wc);
-            // SAFETY: guarded by `can_vec` bounds checks; unaligned access is allowed.
-            unsafe { _mm256_storeu_si256(s.as_mut_ptr().add(t) as *mut __m256i, tmp) };
-            t += 32;
-            continue;
-        }
-        let t_end = (t + 16).min(tlen_pad);
-        for idx in t..t_end {
-            let sq = sf[idx];
-            let qidx = qrr_base + idx as i32;
-            let qq = if qidx >= 0 && (qidx as usize) < qr.len() {
-                qr[qidx as usize]
-            } else {
-                0
-            };
-            s[idx] = if sq == wildcard || qq == wildcard {
-                sc_n
-            } else if sq == qq {
-                sc_mch
-            } else {
-                sc_mis
-            };
-        }
+        let qpos = (qrr_base + t as i32) as usize;
+        // SAFETY: same flat-buffer guarantee, 16-byte load.
+        let sq = unsafe { _mm_loadu_si128(sf.as_ptr().add(t) as *const __m128i) };
+        let qq = unsafe { _mm_loadu_si128(qr.as_ptr().add(qpos) as *const __m128i) };
+        let mask_wc = _mm_or_si128(_mm_cmpeq_epi8(sq, sse_wc), _mm_cmpeq_epi8(qq, sse_wc));
+        let eq = _mm_cmpeq_epi8(sq, qq);
+        let mut tmp = _mm_blendv_epi8(sse_mis, sse_mch, eq);
+        tmp = _mm_blendv_epi8(tmp, sse_nsc, mask_wc);
+        unsafe { _mm_storeu_si128(s.as_mut_ptr().add(t) as *mut __m128i, tmp) };
         t += 16;
     }
 }
@@ -217,7 +205,7 @@ unsafe fn fill_scores_fast_row_sse41(
     qrr_base: i32,
     st0: usize,
     en0: usize,
-    tlen_pad: usize,
+    _tlen_pad: usize,
     wildcard: u8,
     sc_mch: i8,
     sc_mis: i8,
@@ -231,40 +219,19 @@ unsafe fn fill_scores_fast_row_sse41(
     let mis = _mm_set1_epi8(sc_mis);
     let nsc = _mm_set1_epi8(sc_n);
 
+    // Flat buffer layout guarantees all 16-byte SIMD loads within [st0, en0]
+    // are in-bounds; qpos >= 0 is analytically guaranteed for valid t.
     let mut t = st0;
     while t <= en0 {
-        let qpos = qrr_base + t as i32;
-        let can_vec = t + 16 <= tlen_pad && qpos >= 0 && (qpos as usize + 16) <= qr.len();
-        if can_vec {
-            // SAFETY: guarded by `can_vec` bounds checks; unaligned loads/stores are allowed.
-            let sq = unsafe { _mm_loadu_si128(sf.as_ptr().add(t) as *const __m128i) };
-            // SAFETY: guarded by `can_vec` bounds checks; unaligned loads/stores are allowed.
-            let qq = unsafe { _mm_loadu_si128(qr.as_ptr().add(qpos as usize) as *const __m128i) };
-            let mask_wc = _mm_or_si128(_mm_cmpeq_epi8(sq, wc), _mm_cmpeq_epi8(qq, wc));
-            let eq = _mm_cmpeq_epi8(sq, qq);
-            let mut tmp = _mm_blendv_epi8(mis, mch, eq);
-            tmp = _mm_blendv_epi8(tmp, nsc, mask_wc);
-            // SAFETY: guarded by `can_vec` bounds checks; unaligned loads/stores are allowed.
-            unsafe { _mm_storeu_si128(s.as_mut_ptr().add(t) as *mut __m128i, tmp) };
-        } else {
-            let t_end = (t + 16).min(tlen_pad);
-            for idx in t..t_end {
-                let sq = sf[idx];
-                let qidx = qrr_base + idx as i32;
-                let qq = if qidx >= 0 && (qidx as usize) < qr.len() {
-                    qr[qidx as usize]
-                } else {
-                    0
-                };
-                s[idx] = if sq == wildcard || qq == wildcard {
-                    sc_n
-                } else if sq == qq {
-                    sc_mch
-                } else {
-                    sc_mis
-                };
-            }
-        }
+        let qpos = (qrr_base + t as i32) as usize;
+        // SAFETY: flat buffer ensures sf[t..t+15] and qr[qpos..qpos+15] are in-bounds.
+        let sq = unsafe { _mm_loadu_si128(sf.as_ptr().add(t) as *const __m128i) };
+        let qq = unsafe { _mm_loadu_si128(qr.as_ptr().add(qpos) as *const __m128i) };
+        let mask_wc = _mm_or_si128(_mm_cmpeq_epi8(sq, wc), _mm_cmpeq_epi8(qq, wc));
+        let eq = _mm_cmpeq_epi8(sq, qq);
+        let mut tmp = _mm_blendv_epi8(mis, mch, eq);
+        tmp = _mm_blendv_epi8(tmp, nsc, mask_wc);
+        unsafe { _mm_storeu_si128(s.as_mut_ptr().add(t) as *mut __m128i, tmp) };
         t += 16;
     }
 }
@@ -277,7 +244,7 @@ unsafe fn fill_scores_fast_row_neon(
     qrr_base: i32,
     st0: usize,
     en0: usize,
-    tlen_pad: usize,
+    _tlen_pad: usize,
     wildcard: u8,
     sc_mch: i8,
     sc_mis: i8,
@@ -291,40 +258,19 @@ unsafe fn fill_scores_fast_row_neon(
     let mis = vdupq_n_s8(sc_mis);
     let nsc = vdupq_n_s8(sc_n);
 
+    // Flat buffer layout guarantees all 16-byte SIMD loads within [st0, en0]
+    // are in-bounds; qpos >= 0 is analytically guaranteed for valid t.
     let mut t = st0;
     while t <= en0 {
-        let qpos = qrr_base + t as i32;
-        let can_vec = t + 16 <= tlen_pad && qpos >= 0 && (qpos as usize + 16) <= qr.len();
-        if can_vec {
-            // SAFETY: guarded by `can_vec` bounds checks.
-            let sq = unsafe { vld1q_u8(sf.as_ptr().add(t)) };
-            // SAFETY: guarded by `can_vec` bounds checks.
-            let qq = unsafe { vld1q_u8(qr.as_ptr().add(qpos as usize)) };
-            let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
-            let eq = vceqq_u8(sq, qq);
-            let tmp = vbslq_s8(eq, mch, mis);
-            let tmp = vbslq_s8(mask_wc, nsc, tmp);
-            // SAFETY: guarded by `can_vec` bounds checks.
-            unsafe { vst1q_s8(s.as_mut_ptr().add(t), tmp) };
-        } else {
-            let t_end = (t + 16).min(tlen_pad);
-            for idx in t..t_end {
-                let sq = sf[idx];
-                let qidx = qrr_base + idx as i32;
-                let qq = if qidx >= 0 && (qidx as usize) < qr.len() {
-                    qr[qidx as usize]
-                } else {
-                    0
-                };
-                s[idx] = if sq == wildcard || qq == wildcard {
-                    sc_n
-                } else if sq == qq {
-                    sc_mch
-                } else {
-                    sc_mis
-                };
-            }
-        }
+        let qpos = (qrr_base + t as i32) as usize;
+        // SAFETY: flat buffer ensures sf[t..t+15] and qr[qpos..qpos+15] are in-bounds.
+        let sq = unsafe { vld1q_u8(sf.as_ptr().add(t)) };
+        let qq = unsafe { vld1q_u8(qr.as_ptr().add(qpos)) };
+        let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
+        let eq = vceqq_u8(sq, qq);
+        let tmp = vbslq_s8(eq, mch, mis);
+        let tmp = vbslq_s8(mask_wc, nsc, tmp);
+        unsafe { vst1q_s8(s.as_mut_ptr().add(t), tmp) };
         t += 16;
     }
 }
@@ -1170,7 +1116,6 @@ unsafe fn fill_fast_row_dispatch(
     qrr_base: i32,
     st0: usize,
     en0: usize,
-    tlen_pad: usize,
     wildcard: u8,
     sc_mch: i8,
     sc_mis: i8,
@@ -1179,42 +1124,42 @@ unsafe fn fill_fast_row_dispatch(
 ) {
     match backend {
         SimdBackend::Scalar => {
-            fill_scores_fast_row_scalar(sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s)
+            fill_scores_fast_row_scalar(sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s)
         }
         SimdBackend::Avx2 => {
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 fill_scores_fast_row_avx2(
-                    sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                    sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
                 )
             }
             #[cfg(not(target_arch = "x86_64"))]
             fill_scores_fast_row_scalar(
-                sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
             )
         }
         SimdBackend::Sse41 => {
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 fill_scores_fast_row_sse41(
-                    sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                    sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
                 )
             }
             #[cfg(not(target_arch = "x86_64"))]
             fill_scores_fast_row_scalar(
-                sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
             )
         }
         SimdBackend::Neon => {
             #[cfg(target_arch = "aarch64")]
             unsafe {
                 fill_scores_fast_row_neon(
-                    sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                    sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
                 )
             }
             #[cfg(not(target_arch = "aarch64"))]
             fill_scores_fast_row_scalar(
-                sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
             )
         }
     }
@@ -1375,7 +1320,6 @@ pub(super) trait BackendOps {
         qrr_base: i32,
         st0: usize,
         en0: usize,
-        tlen_pad: usize,
         wildcard: u8,
         sc_mch: i8,
         sc_mis: i8,
@@ -1421,6 +1365,29 @@ pub(super) trait BackendOps {
     ) -> (i32, i32);
 }
 
+/// Carve the flat `Workspace::buf` into the seven named DP slices.
+///
+/// Layout: `[u | v | x | y | s | sf | qr+16]`, matching the C reference.
+/// The `s` slice is re-interpreted as `&mut [i8]` (same size/alignment as
+/// `u8`).  All returned slices are non-overlapping sub-slices of `buf`.
+#[inline]
+pub(super) fn split_main_buf(
+    buf: &mut [u8],
+    tlen_pad: usize,
+    qlen_pad: usize,
+) -> (&mut [u8], &mut [u8], &mut [u8], &mut [u8], &mut [i8], &mut [u8], &mut [u8]) {
+    let (u, rest) = buf.split_at_mut(tlen_pad);
+    let (v, rest) = rest.split_at_mut(tlen_pad);
+    let (x, rest) = rest.split_at_mut(tlen_pad);
+    let (y, rest) = rest.split_at_mut(tlen_pad);
+    let (s_raw, rest) = rest.split_at_mut(tlen_pad);
+    let (sf, rest) = rest.split_at_mut(tlen_pad);
+    let (qr, _) = rest.split_at_mut(qlen_pad + 16);
+    // SAFETY: i8 has the same size and alignment as u8; the slice is valid.
+    let s = unsafe { std::slice::from_raw_parts_mut(s_raw.as_mut_ptr() as *mut i8, tlen_pad) };
+    (u, v, x, y, s, sf, qr)
+}
+
 pub(super) struct ScalarOps;
 #[allow(dead_code)]
 pub(super) struct Sse41Ops;
@@ -1436,7 +1403,6 @@ impl BackendOps for ScalarOps {
         qrr_base: i32,
         st0: usize,
         en0: usize,
-        tlen_pad: usize,
         wildcard: u8,
         sc_mch: i8,
         sc_mis: i8,
@@ -1444,7 +1410,7 @@ impl BackendOps for ScalarOps {
         s: &mut [i8],
     ) {
         fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
         );
     }
 
@@ -1568,7 +1534,6 @@ impl BackendOps for Sse41Ops {
         qrr_base: i32,
         st0: usize,
         en0: usize,
-        tlen_pad: usize,
         wildcard: u8,
         sc_mch: i8,
         sc_mis: i8,
@@ -1578,12 +1543,12 @@ impl BackendOps for Sse41Ops {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             fill_scores_fast_row_sse41(
-                sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
             );
         }
         #[cfg(not(target_arch = "x86_64"))]
         fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
         );
     }
 
@@ -1700,7 +1665,6 @@ impl BackendOps for Avx2Ops {
         qrr_base: i32,
         st0: usize,
         en0: usize,
-        tlen_pad: usize,
         wildcard: u8,
         sc_mch: i8,
         sc_mis: i8,
@@ -1710,12 +1674,12 @@ impl BackendOps for Avx2Ops {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             fill_scores_fast_row_avx2(
-                sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
             );
         }
         #[cfg(not(target_arch = "x86_64"))]
         fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
         );
     }
 
@@ -1790,7 +1754,6 @@ impl BackendOps for NeonOps {
         qrr_base: i32,
         st0: usize,
         en0: usize,
-        tlen_pad: usize,
         wildcard: u8,
         sc_mch: i8,
         sc_mis: i8,
@@ -1800,12 +1763,12 @@ impl BackendOps for NeonOps {
         #[cfg(target_arch = "aarch64")]
         unsafe {
             fill_scores_fast_row_neon(
-                sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
             );
         }
         #[cfg(not(target_arch = "aarch64"))]
         fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
         );
     }
 
@@ -1971,23 +1934,17 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
     }
 
     let generic_sc = (input.flag & KSW_EZ_GENERIC_SC) != 0;
-    let (tlen_pad, qlen_pad) = ws.prepare_score_only(qlen, tlen, APPROX);
-    let (u, v, x, y, s, sf, qr, h) = (
-        &mut ws.u,
-        &mut ws.v,
-        &mut ws.x,
-        &mut ws.y,
-        &mut ws.s,
-        &mut ws.sf,
-        &mut ws.qr,
-        &mut ws.h,
-    );
+    ws.prepare_score_only(qlen, tlen, APPROX);
+    let tlen_pad = ws.tlen_pad;
+    let qlen_pad = ws.qlen_pad;
+    let h = &mut ws.h;
+    let (u, v, x, y, s, sf, qr) = split_main_buf(&mut ws.buf, tlen_pad, qlen_pad);
 
     sf[..tlen].copy_from_slice(input.target);
     for (i, qv) in input.query.iter().enumerate() {
         qr[qlen - 1 - i] = *qv;
     }
-    debug_assert_eq!(qr.len(), qlen_pad);
+    debug_assert_eq!(qr.len(), qlen_pad + 16);
 
     let sc_mch = input.mat[0];
     let sc_mis = input.mat[1];
@@ -2045,19 +2002,10 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
         }
 
         if !generic_sc {
+            // SAFETY: selected once from runtime-dispatched backend.
             unsafe {
                 B::fill_fast_row(
-                    sf,
-                    qr,
-                    qrr_base,
-                    st0,
-                    en0,
-                    tlen_pad,
-                    wildcard,
-                    sc_mch,
-                    sc_mis,
-                    sc_n,
-                    s,
+                    sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
                 );
             }
         } else {
@@ -2219,26 +2167,20 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
     let mut n_col = qlen.min(tlen);
     n_col = n_col.min((w + 1) as usize);
     let n_col = n_col + 16;
-    let (tlen_pad, qlen_pad) = ws.prepare_traceback(qlen, tlen, APPROX, rows, n_col);
-    let (u, v, x, y, s, sf, qr, h, off, off_end, p) = (
-        &mut ws.u,
-        &mut ws.v,
-        &mut ws.x,
-        &mut ws.y,
-        &mut ws.s,
-        &mut ws.sf,
-        &mut ws.qr,
-        &mut ws.h,
-        &mut ws.off,
-        &mut ws.off_end,
-        &mut ws.p,
-    );
+    ws.prepare_traceback(qlen, tlen, APPROX, rows, n_col);
+    let tlen_pad = ws.tlen_pad;
+    let qlen_pad = ws.qlen_pad;
+    let h = &mut ws.h;
+    let off = &mut ws.off;
+    let off_end = &mut ws.off_end;
+    let p = &mut ws.p;
+    let (u, v, x, y, s, sf, qr) = split_main_buf(&mut ws.buf, tlen_pad, qlen_pad);
 
     sf[..tlen].copy_from_slice(input.target);
     for (i, qv) in input.query.iter().enumerate() {
         qr[qlen - 1 - i] = *qv;
     }
-    debug_assert_eq!(qr.len(), qlen_pad);
+    debug_assert_eq!(qr.len(), qlen_pad + 16);
 
     let sc_mch = input.mat[0];
     let sc_mis = input.mat[1];
@@ -2302,7 +2244,7 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
             // SAFETY: selected once from runtime-dispatched backend.
             unsafe {
                 B::fill_fast_row(
-                    sf, qr, qrr_base, st0, en0, tlen_pad, wildcard, sc_mch, sc_mis, sc_n, s,
+                    sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
                 );
             }
         } else {
