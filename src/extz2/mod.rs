@@ -160,7 +160,9 @@ impl Workspace {
         n_col: usize,
     ) {
         self.prepare_score_only(qlen, tlen, approx);
+        self.off.clear();
         self.off.resize(rows, 0);
+        self.off_end.clear();
         self.off_end.resize(rows, 0);
         let p_len = rows * n_col;
         // The traceback matrix is written per active row span before reads.
