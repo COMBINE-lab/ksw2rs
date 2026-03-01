@@ -2500,4 +2500,74 @@ mod tests {
         assert!(ez.cigar.is_empty());
         assert!(ez.score > 0);
     }
+
+    /// Verify that reusing an Aligner across calls with varying sequence
+    /// lengths produces the same results as fresh one-shot calls.
+    #[test]
+    fn aligner_reuse_matches_fresh_calls() {
+        use crate::Aligner;
+
+        let mat = mm_mat(1, -4);
+        // Pairs with different lengths to exercise workspace resizing.
+        let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (vec![0, 1, 2, 3, 0, 1, 2, 3], vec![0, 1, 2, 3, 0, 1, 2, 3]),
+            (vec![0, 1, 2], vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1]),
+            (vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3], vec![0, 1, 2, 3]),
+            (vec![0; 50], vec![0; 50]),
+            (vec![0, 1, 2], vec![3, 3, 3]),
+            (vec![0, 1, 2, 3, 0, 1, 2, 3], vec![0, 1, 2, 3, 0, 1, 2, 3]),
+        ];
+
+        let flags = [
+            0,
+            KSW_EZ_EXTZ_ONLY,
+            KSW_EZ_EXTZ_ONLY | KSW_EZ_APPROX_MAX | KSW_EZ_APPROX_DROP,
+        ];
+
+        for flag in flags {
+            let mut aligner = Aligner::new();
+            for (q, t) in &cases {
+                let input = Extz2Input {
+                    query: q,
+                    target: t,
+                    m: 5,
+                    mat: &mat,
+                    q: 4,
+                    e: 1,
+                    w: -1,
+                    zdrop: 40,
+                    end_bonus: 0,
+                    flag,
+                };
+
+                // Fresh call
+                let mut fresh_ez = Extz::default();
+                extz2(&input, &mut fresh_ez);
+
+                // Reused aligner
+                let reused_ez = aligner.align(&input);
+
+                assert_eq!(
+                    reused_ez.score, fresh_ez.score,
+                    "score mismatch: flag={flag} qlen={} tlen={}",
+                    q.len(), t.len(),
+                );
+                assert_eq!(
+                    reused_ez.max, fresh_ez.max,
+                    "max mismatch: flag={flag} qlen={} tlen={}",
+                    q.len(), t.len(),
+                );
+                assert_eq!(
+                    reused_ez.cigar, fresh_ez.cigar,
+                    "cigar mismatch: flag={flag} qlen={} tlen={}",
+                    q.len(), t.len(),
+                );
+                assert_eq!(
+                    reused_ez.zdropped, fresh_ez.zdropped,
+                    "zdropped mismatch: flag={flag} qlen={} tlen={}",
+                    q.len(), t.len(),
+                );
+            }
+        }
+    }
 }

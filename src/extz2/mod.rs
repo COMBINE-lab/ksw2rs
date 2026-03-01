@@ -165,12 +165,8 @@ impl Workspace {
         self.off_end.clear();
         self.off_end.resize(rows, 0);
         let p_len = rows * n_col;
-        // The traceback matrix is written per active row span before reads.
-        if self.p.capacity() < p_len {
-            self.p.reserve(p_len - self.p.capacity());
-        }
-        // SAFETY: readers only access row spans written by DP row kernels.
-        unsafe { self.p.set_len(p_len) };
+        self.p.clear();
+        self.p.resize(p_len, 0);
     }
 }
 
