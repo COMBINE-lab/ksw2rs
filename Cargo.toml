@@ -1,6 +1,6 @@
 [package]
 name = "ksw2rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["ksw2rs contributors"]
 description = "Native Rust port of ksw2 (ksw2_extz2_sse) with stable-Rust SIMD backends"
