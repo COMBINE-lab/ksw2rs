@@ -87,6 +87,10 @@ cargo check --quiet
 
 echo "Committing version bump..."
 git add Cargo.toml
+# cargo check updates Cargo.lock after the version change; include it.
+if [ -f Cargo.lock ]; then
+    git add Cargo.lock
+fi
 git commit -m "release: v${VERSION}"
 
 echo "Tagging ${TAG}..."
