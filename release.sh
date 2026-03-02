@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DO_PUSH=false
+DO_PUBLISH=false
+
 usage() {
-    echo "Usage: $0 <version>"
+    echo "Usage: $0 [--push] [--publish] <version>"
     echo ""
-    echo "Example: $0 0.2.0"
+    echo "Example: $0 --push --publish 0.2.0"
     echo ""
-    echo "This script will:"
+    echo "This script will always:"
     echo "  1. Update the version in Cargo.toml"
     echo "  2. Commit the version bump"
     echo "  3. Create a git tag (v<version>)"
-    echo "  4. Push the commit and tag"
-    echo "  5. Publish to crates.io"
+    echo ""
+    echo "Options:"
+    echo "  --push      Push the commit and tag to origin"
+    echo "  --publish   Publish the crate to crates.io (implies --push)"
     exit 1
 }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --push)    DO_PUSH=true; shift ;;
+        --publish) DO_PUBLISH=true; DO_PUSH=true; shift ;;
+        -h|--help) usage ;;
+        -*)        echo "Error: unknown flag: $1"; usage ;;
+        *)         break ;;
+    esac
+done
 
 if [ $# -ne 1 ]; then
     usage
@@ -52,6 +67,8 @@ CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 echo "Current version: $CURRENT"
 echo "New version:     $VERSION"
 echo "Tag:             $TAG"
+echo "Push:            $DO_PUSH"
+echo "Publish:         $DO_PUBLISH"
 echo ""
 
 read -rp "Proceed? [y/N] " confirm
@@ -75,12 +92,16 @@ git commit -m "release: v${VERSION}"
 echo "Tagging ${TAG}..."
 git tag -a "$TAG" -m "Release ${VERSION}"
 
-echo "Pushing commit and tag..."
-git push
-git push origin "$TAG"
+if $DO_PUSH; then
+    echo "Pushing commit and tag..."
+    git push
+    git push origin "$TAG"
+fi
 
-echo "Publishing to crates.io..."
-cargo publish
+if $DO_PUBLISH; then
+    echo "Publishing to crates.io..."
+    cargo publish
+fi
 
 echo ""
 echo "Released ${TAG} successfully."
