@@ -166,7 +166,12 @@ impl Workspace {
         self.off_end.resize(rows, 0);
         let p_len = rows * n_col;
         self.p.clear();
-        self.p.resize(p_len, 0);
+        self.p.reserve(p_len);
+        // SAFETY: clear() above sets len to 0, so reserve(p_len) guarantees
+        // capacity >= p_len.  The traceback matrix is fully written per active
+        // row span by the DP kernels before any read, so leaving bytes
+        // uninitialised is safe.
+        unsafe { self.p.set_len(p_len) };
     }
 }
 
