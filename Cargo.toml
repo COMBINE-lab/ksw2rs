@@ -2,6 +2,14 @@
 name = "ksw2rs"
 version = "0.1.0"
 edition = "2024"
+authors = ["ksw2rs contributors"]
+description = "Native Rust port of ksw2 (ksw2_extz2_sse) with stable-Rust SIMD backends"
+license = "BSD-3-Clause"
+repository = "https://github.com/COMBINE-lab/ksw2rs"
+homepage = "https://github.com/COMBINE-lab/ksw2rs"
+readme = "README.md"
+keywords = ["bioinformatics", "alignment", "simd", "ksw2", "sequence-alignment"]
+categories = ["science", "algorithms"]
 
 [dependencies]
 

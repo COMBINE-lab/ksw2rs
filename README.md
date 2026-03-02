@@ -2,6 +2,23 @@
 
 `ksw2rs` is a native Rust port of [ksw2](https://github.com/lh3/ksw2), focused on preserving ksw2 behavior and performance characteristics as directly as possible.
 
+## Building for optimal performance
+
+`ksw2rs` uses runtime feature detection to dispatch to the best available SIMD backend (AVX2, SSE4.1, or NEON). However, to ensure the compiler can generate optimal code for all backends, you should compile with native target CPU support:
+
+```sh
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+Alternatively, add this to your project's `.cargo/config.toml`:
+
+```toml
+[build]
+rustflags = ["-C", "target-cpu=native"]
+```
+
+This ensures the compiler is aware of all SIMD instruction sets your CPU supports, enabling the best runtime dispatch path. Without this, the compiler may not emit AVX2 or other advanced instruction variants even though the runtime detection selects them.
+
 This project is closely related to [minimap2](https://github.com/lh3/minimap2), where ksw2 is used as a core alignment component.
 
 ## Scope
