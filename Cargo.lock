@@ -234,7 +234,7 @@ dependencies = [
 
 [[package]]
 name = "ksw2rs"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "cc",
  "criterion",
