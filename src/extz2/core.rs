@@ -921,7 +921,7 @@ unsafe fn update_h_exact_sse41(
     en0: usize,
     qe: i32,
 ) -> (i32, i32) {
-    use core::ptr;
+    use ::core::ptr;
     use std::arch::x86_64::*;
 
     if en0 > 0 {
@@ -981,7 +981,7 @@ unsafe fn update_h_exact_avx2(
     en0: usize,
     qe: i32,
 ) -> (i32, i32) {
-    use core::ptr;
+    use ::core::ptr;
     use std::arch::x86_64::*;
 
     if en0 > 0 {
