@@ -203,38 +203,62 @@ pub fn extz2_scalar_with_workspace(input: &Extz2Input<'_>, ez: &mut Extz, ws: &m
     core::extz2_core::<core::ScalarOps>(input, ez, ws);
 }
 
-#[inline]
-fn extz2_dispatch(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
+/// A resolved alignment kernel: the score-fill implementation specialized for a
+/// particular CPU's SIMD capability. Obtain one with [`resolve_kernel`].
+///
+/// Calling a kernel is `unsafe` because it may use target features the calling
+/// context cannot statically guarantee; it is sound to call exactly the kernel
+/// that [`resolve_kernel`] returned on the same machine, since the resolver picks
+/// it from runtime CPU feature detection.
+pub type KernelFn = unsafe fn(&Extz2Input<'_>, &mut Extz, &mut Workspace);
+
+/// Scalar kernel, wrapped to share the [`KernelFn`] signature with the SIMD ones.
+unsafe fn extz2_scalar_kernel(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
+    core::extz2_core::<core::ScalarOps>(input, ez, ws);
+}
+
+/// Detect the running CPU's SIMD capability **once** and return the best
+/// available kernel (AVX2 > SSE4.1 > scalar on x86-64; NEON > scalar on aarch64).
+///
+/// Resolve this a single time — at program start or in [`Aligner::new`] — and
+/// store the returned pointer; then every alignment dispatches through one
+/// indirect call with no per-call feature check. (It is cheap to call more than
+/// once, but resolving once is the intended pattern.)
+pub fn resolve_kernel() -> KernelFn {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
-            // Safe because runtime detection guarantees AVX2 availability.
-            unsafe {
-                extz2_avx2(input, ez, ws);
-            }
-            return;
+            return extz2_avx2;
         }
         if std::is_x86_feature_detected!("sse4.1") {
-            // Safe because runtime detection guarantees SSE4.1 availability.
-            unsafe {
-                extz2_sse41(input, ez, ws);
-            }
-            return;
+            return extz2_sse41;
         }
     }
 
     #[cfg(target_arch = "aarch64")]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
-            // Safe because runtime detection guarantees NEON availability.
-            unsafe {
-                extz2_neon(input, ez, ws);
-            }
-            return;
+            return extz2_neon;
         }
     }
 
-    core::extz2_core::<core::ScalarOps>(input, ez, ws);
+    extz2_scalar_kernel
+}
+
+/// The kernel used by the free-function API ([`extz2`], [`extz2_with_workspace`]),
+/// resolved once on first use and cached for the life of the process.
+#[inline]
+fn cached_kernel() -> KernelFn {
+    use std::sync::OnceLock;
+    static KERNEL: OnceLock<KernelFn> = OnceLock::new();
+    *KERNEL.get_or_init(resolve_kernel)
+}
+
+#[inline]
+fn extz2_dispatch(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
+    // SAFETY: `cached_kernel()` selected this kernel from this CPU's detected
+    // features, so any target feature it requires is present.
+    unsafe { (cached_kernel())(input, ez, ws) }
 }
 
 #[cfg(target_arch = "x86_64")]

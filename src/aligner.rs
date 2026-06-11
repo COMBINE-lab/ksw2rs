@@ -1,4 +1,4 @@
-use crate::{Extz, Extz2Input, Workspace, extz2_scalar_with_workspace, extz2_with_workspace};
+use crate::{Extz, Extz2Input, KernelFn, Workspace, extz2_scalar_with_workspace, resolve_kernel};
 
 /// Reusable alignment engine for repeated calls.
 ///
@@ -42,17 +42,32 @@ use crate::{Extz, Extz2Input, Workspace, extz2_scalar_with_workspace, extz2_with
 /// let result = aligner.align(&input);
 /// assert!(result.score > 0);
 /// ```
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Aligner {
     workspace: Workspace,
     result: Extz,
+    /// SIMD kernel resolved once at construction (see [`resolve_kernel`]); every
+    /// `align` call dispatches through it with no per-call feature check.
+    kernel: KernelFn,
+}
+
+impl Default for Aligner {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Aligner {
-    /// Create a new aligner with empty reusable buffers.
+    /// Create a new aligner with empty reusable buffers, resolving the best SIMD
+    /// kernel for this CPU once.
     #[inline]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            workspace: Workspace::default(),
+            result: Extz::default(),
+            kernel: resolve_kernel(),
+        }
     }
 
     /// Create a new aligner from a caller-provided workspace.
@@ -64,6 +79,7 @@ impl Aligner {
         Self {
             workspace,
             result: Extz::default(),
+            kernel: resolve_kernel(),
         }
     }
 
@@ -74,7 +90,9 @@ impl Aligner {
     /// same `Aligner`.
     #[inline]
     pub fn align(&mut self, input: &Extz2Input<'_>) -> &Extz {
-        extz2_with_workspace(input, &mut self.result, &mut self.workspace);
+        // SAFETY: `kernel` was resolved from this CPU's detected features in
+        // `new`/`with_workspace`, so its target feature is present here.
+        unsafe { (self.kernel)(input, &mut self.result, &mut self.workspace) };
         &self.result
     }
 
@@ -91,7 +109,8 @@ impl Aligner {
     /// aligner's internal workspace.
     #[inline]
     pub fn align_into(&mut self, input: &Extz2Input<'_>, out: &mut Extz) {
-        extz2_with_workspace(input, out, &mut self.workspace);
+        // SAFETY: see `align`; `kernel` matches this CPU's features.
+        unsafe { (self.kernel)(input, out, &mut self.workspace) };
     }
 
     /// Immutable access to the reusable scratch workspace.
