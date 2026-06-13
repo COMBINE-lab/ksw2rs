@@ -1,10 +1,10 @@
-use std::time::Duration;
 use std::hint::black_box;
+use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use ksw2rs::{
-    Extz, Extz2Input, KSW_EZ_APPROX_MAX, KSW_EZ_SCORE_ONLY, Workspace, extz2_with_workspace,
-    extz2_scalar_with_workspace,
+    Extz, Extz2Input, KSW_EZ_APPROX_MAX, KSW_EZ_SCORE_ONLY, Workspace, extz2_scalar_with_workspace,
+    extz2_with_workspace,
 };
 
 #[cfg(has_c_ref)]
@@ -101,7 +101,11 @@ fn bench_extz2(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(800));
     group.measurement_time(Duration::from_secs(4));
 
-    for (qlen, tlen) in [(128usize, 128usize), (512usize, 512usize), (1024usize, 1024usize)] {
+    for (qlen, tlen) in [
+        (128usize, 128usize),
+        (512usize, 512usize),
+        (1024usize, 1024usize),
+    ] {
         let (q, t, mat) = make_input(qlen, tlen);
         let input = Extz2Input {
             query: &q,
@@ -119,14 +123,18 @@ fn bench_extz2(c: &mut Criterion) {
         let bytes = (qlen + tlen) as u64;
         group.throughput(Throughput::Bytes(bytes));
 
-        group.bench_with_input(BenchmarkId::new("rust_auto", format!("{}x{}", qlen, tlen)), &input, |b, i| {
-            let mut ez = Extz::default();
-            let mut ws = Workspace::default();
-            b.iter(|| {
-                extz2_with_workspace(black_box(i), &mut ez, &mut ws);
-                black_box(ez.score);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("rust_auto", format!("{}x{}", qlen, tlen)),
+            &input,
+            |b, i| {
+                let mut ez = Extz::default();
+                let mut ws = Workspace::default();
+                b.iter(|| {
+                    extz2_with_workspace(black_box(i), &mut ez, &mut ws);
+                    black_box(ez.score);
+                });
+            },
+        );
 
         group.bench_with_input(
             BenchmarkId::new("rust_scalar", format!("{}x{}", qlen, tlen)),
@@ -142,9 +150,13 @@ fn bench_extz2(c: &mut Criterion) {
         );
 
         #[cfg(has_c_ref)]
-        group.bench_with_input(BenchmarkId::new("c_ref", format!("{}x{}", qlen, tlen)), &input, |b, i| {
-            b.iter(|| c_ref(black_box(i)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("c_ref", format!("{}x{}", qlen, tlen)),
+            &input,
+            |b, i| {
+                b.iter(|| c_ref(black_box(i)));
+            },
+        );
     }
 
     group.finish();

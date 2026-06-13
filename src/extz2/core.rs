@@ -410,9 +410,19 @@ unsafe fn dp_row_score_only_neon(
         b = vsubq_u8(b, zq);
 
         // SAFETY: valid padded stores.
-        unsafe { vst1q_u8(x.as_mut_ptr().add(t), vreinterpretq_u8_s8(vmaxq_s8(vreinterpretq_s8_u8(a), zero))) };
+        unsafe {
+            vst1q_u8(
+                x.as_mut_ptr().add(t),
+                vreinterpretq_u8_s8(vmaxq_s8(vreinterpretq_s8_u8(a), zero)),
+            )
+        };
         // SAFETY: valid padded stores.
-        unsafe { vst1q_u8(y.as_mut_ptr().add(t), vreinterpretq_u8_s8(vmaxq_s8(vreinterpretq_s8_u8(b), zero))) };
+        unsafe {
+            vst1q_u8(
+                y.as_mut_ptr().add(t),
+                vreinterpretq_u8_s8(vmaxq_s8(vreinterpretq_s8_u8(b), zero)),
+            )
+        };
 
         t += 16;
     }
@@ -441,7 +451,10 @@ unsafe fn dp_row_score_only_right_sse41(
     let maxv = _mm_set1_epi8(max_sc_transformed as i8);
     let mut t = stv;
     while t <= env {
-        let mut z = _mm_add_epi8(unsafe { _mm_loadu_si128(s.as_ptr().add(t) as *const __m128i) }, qe2v);
+        let mut z = _mm_add_epi8(
+            unsafe { _mm_loadu_si128(s.as_ptr().add(t) as *const __m128i) },
+            qe2v,
+        );
         let xt_load = unsafe { _mm_loadu_si128(x.as_ptr().add(t) as *const __m128i) };
         let xt_hi = _mm_srli_si128(xt_load, 15);
         let x1v = _mm_cvtsi32_si128(i32::from(x1));
@@ -454,7 +467,10 @@ unsafe fn dp_row_score_only_right_sse41(
         v1 = _mm_cvtsi128_si32(vt_hi) as u8;
         let mut a = _mm_add_epi8(xt1, vt1);
         let ut = unsafe { _mm_loadu_si128(u.as_ptr().add(t) as *const __m128i) };
-        let mut b = _mm_add_epi8(unsafe { _mm_loadu_si128(y.as_ptr().add(t) as *const __m128i) }, ut);
+        let mut b = _mm_add_epi8(
+            unsafe { _mm_loadu_si128(y.as_ptr().add(t) as *const __m128i) },
+            ut,
+        );
         z = _mm_max_epi8(z, a);
         z = _mm_max_epu8(z, b);
         z = _mm_min_epu8(z, maxv);
@@ -635,7 +651,10 @@ unsafe fn dp_row_traceback_sse41(
     let neg1 = _mm_set1_epi8(-1);
     let mut t = stv;
     while t <= env {
-        let mut z = _mm_add_epi8(unsafe { _mm_loadu_si128(s.as_ptr().add(t) as *const __m128i) }, qe2v);
+        let mut z = _mm_add_epi8(
+            unsafe { _mm_loadu_si128(s.as_ptr().add(t) as *const __m128i) },
+            qe2v,
+        );
         let xt_load = unsafe { _mm_loadu_si128(x.as_ptr().add(t) as *const __m128i) };
         let xt_hi = _mm_srli_si128(xt_load, 15);
         let x1v = _mm_cvtsi32_si128(i32::from(x1));
@@ -648,7 +667,10 @@ unsafe fn dp_row_traceback_sse41(
         v1 = _mm_cvtsi128_si32(vt_hi) as u8;
         let mut a = _mm_add_epi8(xt1, vt1);
         let ut = unsafe { _mm_loadu_si128(u.as_ptr().add(t) as *const __m128i) };
-        let mut b = _mm_add_epi8(unsafe { _mm_loadu_si128(y.as_ptr().add(t) as *const __m128i) }, ut);
+        let mut b = _mm_add_epi8(
+            unsafe { _mm_loadu_si128(y.as_ptr().add(t) as *const __m128i) },
+            ut,
+        );
         let mut d;
         if !right_align {
             d = _mm_and_si128(_mm_cmpgt_epi8(a, z), flag1);
@@ -671,15 +693,23 @@ unsafe fn dp_row_traceback_sse41(
         if !right_align {
             let am = _mm_cmpgt_epi8(a, zero);
             let bm = _mm_cmpgt_epi8(b, zero);
-            unsafe { _mm_storeu_si128(x.as_mut_ptr().add(t) as *mut __m128i, _mm_and_si128(a, am)) };
-            unsafe { _mm_storeu_si128(y.as_mut_ptr().add(t) as *mut __m128i, _mm_and_si128(b, bm)) };
+            unsafe {
+                _mm_storeu_si128(x.as_mut_ptr().add(t) as *mut __m128i, _mm_and_si128(a, am))
+            };
+            unsafe {
+                _mm_storeu_si128(y.as_mut_ptr().add(t) as *mut __m128i, _mm_and_si128(b, bm))
+            };
             d = _mm_or_si128(d, _mm_and_si128(am, flag8));
             d = _mm_or_si128(d, _mm_and_si128(bm, flag16));
         } else {
             let am = _mm_cmpgt_epi8(a, neg1); // a >= 0
             let bm = _mm_cmpgt_epi8(b, neg1); // b >= 0
-            unsafe { _mm_storeu_si128(x.as_mut_ptr().add(t) as *mut __m128i, _mm_and_si128(a, am)) };
-            unsafe { _mm_storeu_si128(y.as_mut_ptr().add(t) as *mut __m128i, _mm_and_si128(b, bm)) };
+            unsafe {
+                _mm_storeu_si128(x.as_mut_ptr().add(t) as *mut __m128i, _mm_and_si128(a, am))
+            };
+            unsafe {
+                _mm_storeu_si128(y.as_mut_ptr().add(t) as *mut __m128i, _mm_and_si128(b, bm))
+            };
             d = _mm_or_si128(d, _mm_and_si128(am, flag8));
             d = _mm_or_si128(d, _mm_and_si128(bm, flag16));
         }
@@ -1123,9 +1153,9 @@ unsafe fn fill_fast_row_dispatch(
     s: &mut [i8],
 ) {
     match backend {
-        SimdBackend::Scalar => {
-            fill_scores_fast_row_scalar(sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s)
-        }
+        SimdBackend::Scalar => fill_scores_fast_row_scalar(
+            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
+        ),
         SimdBackend::Avx2 => {
             #[cfg(target_arch = "x86_64")]
             unsafe {
@@ -1375,7 +1405,15 @@ pub(super) fn split_main_buf(
     buf: &mut [u8],
     tlen_pad: usize,
     qlen_pad: usize,
-) -> (&mut [u8], &mut [u8], &mut [u8], &mut [u8], &mut [i8], &mut [u8], &mut [u8]) {
+) -> (
+    &mut [u8],
+    &mut [u8],
+    &mut [u8],
+    &mut [u8],
+    &mut [i8],
+    &mut [u8],
+    &mut [u8],
+) {
     let (u, rest) = buf.split_at_mut(tlen_pad);
     let (v, rest) = rest.split_at_mut(tlen_pad);
     let (x, rest) = rest.split_at_mut(tlen_pad);
@@ -1393,6 +1431,7 @@ pub(super) struct ScalarOps;
 pub(super) struct Sse41Ops;
 #[allow(dead_code)]
 pub(super) struct Avx2Ops;
+#[allow(dead_code)] // constructed only on aarch64; dead on other targets (cf. Sse41Ops/Avx2Ops)
 pub(super) struct NeonOps;
 
 impl BackendOps for ScalarOps {
@@ -1571,16 +1610,51 @@ impl BackendOps for Sse41Ops {
         unsafe {
             if RIGHT {
                 dp_row_score_only_right_sse41(
-                    u, v, x, y, s, stv, env, q, qe2, max_sc_transformed, x1, v1,
+                    u,
+                    v,
+                    x,
+                    y,
+                    s,
+                    stv,
+                    env,
+                    q,
+                    qe2,
+                    max_sc_transformed,
+                    x1,
+                    v1,
                 );
             } else {
-                dp_row_score_only_sse41(u, v, x, y, s, stv, env, q, qe2, max_sc_transformed, x1, v1);
+                dp_row_score_only_sse41(
+                    u,
+                    v,
+                    x,
+                    y,
+                    s,
+                    stv,
+                    env,
+                    q,
+                    qe2,
+                    max_sc_transformed,
+                    x1,
+                    v1,
+                );
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
         unsafe {
             ScalarOps::dp_row_score_only::<RIGHT>(
-                u, v, x, y, s, stv, env, q, qe2, max_sc_transformed, x1, v1,
+                u,
+                v,
+                x,
+                y,
+                s,
+                stv,
+                env,
+                q,
+                qe2,
+                max_sc_transformed,
+                x1,
+                v1,
             );
         }
     }
@@ -1700,7 +1774,18 @@ impl BackendOps for Avx2Ops {
     ) {
         unsafe {
             Sse41Ops::dp_row_score_only::<RIGHT>(
-                u, v, x, y, s, stv, env, q, qe2, max_sc_transformed, x1, v1,
+                u,
+                v,
+                x,
+                y,
+                s,
+                stv,
+                env,
+                q,
+                qe2,
+                max_sc_transformed,
+                x1,
+                v1,
             );
         }
     }
@@ -1723,7 +1808,19 @@ impl BackendOps for Avx2Ops {
     ) {
         unsafe {
             Sse41Ops::dp_row_traceback::<RIGHT>(
-                u, v, x, y, s, p_row, stv, env, q, qe2, max_sc_transformed, x1, v1,
+                u,
+                v,
+                x,
+                y,
+                s,
+                p_row,
+                stv,
+                env,
+                q,
+                qe2,
+                max_sc_transformed,
+                x1,
+                v1,
             );
         }
     }
@@ -1791,7 +1888,18 @@ impl BackendOps for NeonOps {
         unsafe {
             if RIGHT {
                 dp_row_score_only_right_neon(
-                    u, v, x, y, s, stv, env, q, qe2, max_sc_transformed, x1, v1,
+                    u,
+                    v,
+                    x,
+                    y,
+                    s,
+                    stv,
+                    env,
+                    q,
+                    qe2,
+                    max_sc_transformed,
+                    x1,
+                    v1,
                 );
             } else {
                 dp_row_score_only_neon(u, v, x, y, s, stv, env, q, qe2, max_sc_transformed, x1, v1);
@@ -1800,7 +1908,18 @@ impl BackendOps for NeonOps {
         #[cfg(not(target_arch = "aarch64"))]
         unsafe {
             ScalarOps::dp_row_score_only::<RIGHT>(
-                u, v, x, y, s, stv, env, q, qe2, max_sc_transformed, x1, v1,
+                u,
+                v,
+                x,
+                y,
+                s,
+                stv,
+                env,
+                q,
+                qe2,
+                max_sc_transformed,
+                x1,
+                v1,
             );
         }
     }
@@ -1877,11 +1996,7 @@ impl BackendOps for NeonOps {
     }
 }
 
-fn extz2_core_score_only<B: BackendOps>(
-    input: &Extz2Input<'_>,
-    ez: &mut Extz,
-    ws: &mut Workspace,
-) {
+fn extz2_core_score_only<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
     if (input.flag & KSW_EZ_APPROX_MAX) != 0 {
         if (input.flag & KSW_EZ_RIGHT) != 0 {
             extz2_core_score_only_impl::<B, true, true>(input, ez, ws);
@@ -2512,7 +2627,10 @@ mod tests {
         let cases: Vec<(Vec<u8>, Vec<u8>)> = vec![
             (vec![0, 1, 2, 3, 0, 1, 2, 3], vec![0, 1, 2, 3, 0, 1, 2, 3]),
             (vec![0, 1, 2], vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1]),
-            (vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3], vec![0, 1, 2, 3]),
+            (
+                vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3],
+                vec![0, 1, 2, 3],
+            ),
             (vec![0; 50], vec![0; 50]),
             (vec![0, 1, 2], vec![3, 3, 3]),
             (vec![0, 1, 2, 3, 0, 1, 2, 3], vec![0, 1, 2, 3, 0, 1, 2, 3]),
@@ -2548,24 +2666,32 @@ mod tests {
                 let reused_ez = aligner.align(&input);
 
                 assert_eq!(
-                    reused_ez.score, fresh_ez.score,
+                    reused_ez.score,
+                    fresh_ez.score,
                     "score mismatch: flag={flag} qlen={} tlen={}",
-                    q.len(), t.len(),
+                    q.len(),
+                    t.len(),
                 );
                 assert_eq!(
-                    reused_ez.max, fresh_ez.max,
+                    reused_ez.max,
+                    fresh_ez.max,
                     "max mismatch: flag={flag} qlen={} tlen={}",
-                    q.len(), t.len(),
+                    q.len(),
+                    t.len(),
                 );
                 assert_eq!(
-                    reused_ez.cigar, fresh_ez.cigar,
+                    reused_ez.cigar,
+                    fresh_ez.cigar,
                     "cigar mismatch: flag={flag} qlen={} tlen={}",
-                    q.len(), t.len(),
+                    q.len(),
+                    t.len(),
                 );
                 assert_eq!(
-                    reused_ez.zdropped, fresh_ez.zdropped,
+                    reused_ez.zdropped,
+                    fresh_ez.zdropped,
                     "zdropped mismatch: flag={flag} qlen={} tlen={}",
-                    q.len(), t.len(),
+                    q.len(),
+                    t.len(),
                 );
             }
         }

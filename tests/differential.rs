@@ -1,6 +1,6 @@
 #![cfg(has_c_ref)]
 
-use ksw2rs::{extz2, Extz, Extz2Input, KSW_EZ_SCORE_ONLY};
+use ksw2rs::{Extz, Extz2Input, KSW_EZ_SCORE_ONLY, extz2};
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -153,12 +153,9 @@ fn differential_cigar_simple_case() {
     extz2(&input, &mut rz);
     let cz = run_c_ref(&input);
 
-    let rh = rz
-        .cigar
-        .iter()
-        .fold(1469598103934665603u64, |acc, &x| {
-            (acc ^ x as u64).wrapping_mul(1099511628211)
-        });
+    let rh = rz.cigar.iter().fold(1469598103934665603u64, |acc, &x| {
+        (acc ^ x as u64).wrapping_mul(1099511628211)
+    });
 
     assert_eq!(rz.score, cz.score);
     assert_eq!(rz.cigar.len() as u32, cz.n_cigar);

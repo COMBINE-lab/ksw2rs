@@ -197,8 +197,7 @@ fn run_pair(name: &str, q_path: &str, t_path: &str) -> Result<(), String> {
                 && rz.mte == cz.mte
                 && rz.mte_q == cz.mte_q
                 && (rz.zdropped as i32) == cz.zdropped;
-            let cigar_parity =
-                (rz.cigar.len() as u32) == cz.n_cigar && rust_hash == cz.cigar_hash;
+            let cigar_parity = (rz.cigar.len() as u32) == cz.n_cigar && rust_hash == cz.cigar_hash;
             let parity = if (flag & KSW_EZ_SCORE_ONLY) != 0 {
                 base_parity
             } else {
@@ -276,7 +275,11 @@ fn run_pair(name: &str, q_path: &str, t_path: &str) -> Result<(), String> {
 
 fn main() {
     let pairs = [
-        ("MT-human_vs_MT-orang", "test/MT-human.fa", "test/MT-orang.fa"),
+        (
+            "MT-human_vs_MT-orang",
+            "test/MT-human.fa",
+            "test/MT-orang.fa",
+        ),
         ("q2_vs_t2", "test/q2.fa", "test/t2.fa"),
     ];
 
