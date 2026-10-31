@@ -23,6 +23,13 @@ pub const KSW_EZ_APPROX_DROP: u32 = 0x10;
 pub const KSW_EZ_EXTZ_ONLY: u32 = 0x40;
 /// Keep CIGAR reversed.
 pub const KSW_EZ_REV_CIGAR: u32 = 0x80;
+/// Exact score path only (no [`KSW_EZ_APPROX_MAX`]): do not track the overall
+/// maximum. `mqe`, `mte` and `score` are computed exactly as without it, but
+/// `max`, `max_q` and `max_t` are left untouched, which skips a horizontal
+/// maximum per anti-diagonal. Applies to score-only alignment
+/// ([`KSW_EZ_SCORE_ONLY`]) without z-drop (`zdrop < 0`), the cases that never
+/// read the maximum; otherwise the flag is ignored.
+pub const KSW_EZ_NO_MAX: u32 = 0x1000;
 
 /// BAM-like CIGAR op code: match/mismatch.
 pub const KSW_CIGAR_MATCH: u32 = 0;
