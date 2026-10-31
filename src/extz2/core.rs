@@ -915,6 +915,22 @@ unsafe fn dp_row_traceback_dispatch(
     }
 }
 
+/// [`update_h_exact_scalar`] without the maximum: the same updates to `h`, in
+/// the same order, for [`super::KSW_EZ_NO_MAX`]. A plain widening add: the
+/// compiler vectorizes it well enough that per-backend versions measured no
+/// faster.
+#[inline]
+fn update_h_no_max(h: &mut [i32], v: &[u8], u: &[u8], st0: usize, en0: usize, qe: i32) {
+    if en0 > 0 {
+        h[en0] = h[en0 - 1] + i32::from(u[en0]) - qe;
+    } else {
+        h[en0] = h[en0] + i32::from(v[en0]) - qe;
+    }
+    for (ht, &vt) in h[st0..en0].iter_mut().zip(&v[st0..en0]) {
+        *ht += i32::from(vt) - qe;
+    }
+}
+
 #[inline]
 fn update_h_exact_scalar(
     h: &mut [i32],
@@ -2029,6 +2045,8 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
     let q = i32::from(input.q);
     let e = i32::from(input.e);
     let qe = q + e;
+    // see KSW_EZ_NO_MAX: the maximum is only skipped when z-drop is off
+    let no_max = (input.flag & super::KSW_EZ_NO_MAX) != 0 && input.zdrop < 0;
     let qe2 = qe * 2;
 
     let mut w = input.w;
@@ -2176,7 +2194,10 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
         if !APPROX {
             let max_h;
             let max_t;
-            if r > 0 {
+            if r > 0 && no_max {
+                update_h_no_max(h, v, u, st0, en0, qe);
+                (max_h, max_t) = (KSW_NEG_INF, 0);
+            } else if r > 0 {
                 unsafe {
                     (max_h, max_t) = B::update_h_exact(h, v, u, st0, en0, qe);
                 }
@@ -2194,7 +2215,7 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
                 ez.mqe = h[st0];
                 ez.mqe_t = st0 as i32;
             }
-            if apply_zdrop(ez, max_h, r, max_t, input.zdrop, input.e) {
+            if !no_max && apply_zdrop(ez, max_h, r, max_t, input.zdrop, input.e) {
                 break;
             }
             if r == rows as i32 - 1 && en0 + 1 == tlen {
@@ -2257,6 +2278,10 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
     let q = i32::from(input.q);
     let e = i32::from(input.e);
     let qe = q + e;
+    // see KSW_EZ_NO_MAX: the maximum is only skipped when z-drop is off
+    // KSW_EZ_NO_MAX applies to score-only alignment: the traceback start
+    // below depends on the tracked maximum
+    let no_max = false;
     let qe2 = qe * 2;
 
     let mut w = input.w;
@@ -2423,7 +2448,10 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
             let max_h;
             let max_t;
 
-            if r > 0 {
+            if r > 0 && no_max {
+                update_h_no_max(h, v, u, st0, en0, qe);
+                (max_h, max_t) = (KSW_NEG_INF, 0);
+            } else if r > 0 {
                 // SAFETY: selected once from runtime-dispatched backend.
                 unsafe {
                     (max_h, max_t) = B::update_h_exact(h, v, u, st0, en0, qe);
@@ -2442,7 +2470,7 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
                 ez.mqe = h[st0];
                 ez.mqe_t = st0 as i32;
             }
-            if apply_zdrop(ez, max_h, r, max_t, input.zdrop, input.e) {
+            if !no_max && apply_zdrop(ez, max_h, r, max_t, input.zdrop, input.e) {
                 break;
             }
             if r == rows as i32 - 1 && en0 + 1 == tlen {
@@ -2589,6 +2617,79 @@ mod tests {
         assert_eq!(ez.cigar.len(), 1);
         assert_eq!(ez.cigar[0] & 0x0f, KSW_CIGAR_MATCH);
         assert_eq!(ez.cigar[0] >> 4, q.len() as u32);
+    }
+
+    /// `KSW_EZ_NO_MAX` leaves `mqe`, `mte` and `score` exactly as the exact
+    /// path computes them in score-only mode, for both gap alignments and on
+    /// the dispatched and scalar backends; with a CIGAR requested the flag is
+    /// ignored, so the whole result is unchanged.
+    #[test]
+    fn no_max_keeps_mqe_mte_and_score() {
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mat = mm_mat(2, -4);
+        let mut aligner = crate::Aligner::new();
+        for case in 0..5_000 {
+            let ql = 1 + rnd(160) as usize;
+            let tl = 1 + rnd(200) as usize;
+            let t: Vec<u8> = (0..tl).map(|_| rnd(5) as u8).collect();
+            let q: Vec<u8> = (0..ql)
+                .map(|i| {
+                    if i < tl && rnd(8) != 0 {
+                        t[i]
+                    } else {
+                        rnd(5) as u8
+                    }
+                })
+                .collect();
+            let w = if case % 3 == 0 { -1 } else { rnd(40) as i32 };
+            for base in [
+                0,
+                KSW_EZ_SCORE_ONLY,
+                KSW_EZ_RIGHT,
+                KSW_EZ_SCORE_ONLY | KSW_EZ_RIGHT,
+            ] {
+                let input = Extz2Input {
+                    query: &q,
+                    target: &t,
+                    m: 5,
+                    mat: &mat,
+                    q: 6,
+                    e: 2,
+                    w,
+                    zdrop: -1,
+                    end_bonus: 0,
+                    flag: base,
+                };
+                let fast_input = Extz2Input {
+                    flag: base | KSW_EZ_NO_MAX,
+                    ..input
+                };
+                for scalar in [false, true] {
+                    let (want, got) = if scalar {
+                        let a = aligner.align_scalar(&input).clone();
+                        (a, aligner.align_scalar(&fast_input).clone())
+                    } else {
+                        let a = aligner.align(&input).clone();
+                        (a, aligner.align(&fast_input).clone())
+                    };
+                    let what = format!("case {case} flag {base:#x} w {w} scalar {scalar}");
+                    assert_eq!(got.mqe, want.mqe, "{what}");
+                    assert_eq!(got.mqe_t, want.mqe_t, "{what}");
+                    assert_eq!(got.mte, want.mte, "{what}");
+                    assert_eq!(got.mte_q, want.mte_q, "{what}");
+                    assert_eq!(got.score, want.score, "{what}");
+                    if base & KSW_EZ_SCORE_ONLY == 0 {
+                        assert_eq!(got.cigar, want.cigar, "{what}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
