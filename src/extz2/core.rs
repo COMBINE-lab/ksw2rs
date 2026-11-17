@@ -957,9 +957,22 @@ fn update_h_exact_scalar(
     (max_h, max_t)
 }
 
+// Exact-max row update, `update_h_exact_scalar` without per-block branches:
+// the same `h` updates and the same `(max_h, max_t)`: the strictly greatest
+// interior score at its first position if it beats `h[en0]`, else `h[en0]` at
+// `en0`. The previous per-backend versions reduced each block horizontally and
+// branched on the running maximum, a loop-carried scalar dependency that cost
+// about half the time of an exact score-only alignment. Here every lane keeps
+// its own maximum and the first position reaching it (strict `>`, so within a
+// lane the earliest position wins), with independent accumulators so no step
+// waits on the previous one, and the lanes are reduced once per row: the
+// maximum is the largest lane maximum, its first position the smallest
+// position among the lanes holding it.
+
+/// SSE4.1 lane-wise exact-max row update (also used by the AVX2 backend).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
-unsafe fn update_h_exact_sse41(
+unsafe fn update_h_exact_lanes_sse41(
     h: &mut [i32],
     v: &[u8],
     u: &[u8],
@@ -967,122 +980,93 @@ unsafe fn update_h_exact_sse41(
     en0: usize,
     qe: i32,
 ) -> (i32, i32) {
-    use ::core::ptr;
     use std::arch::x86_64::*;
 
-    if en0 > 0 {
-        h[en0] = h[en0 - 1] + i32::from(u[en0]) - qe;
+    let h_en = if en0 > 0 {
+        h[en0 - 1] + i32::from(u[en0]) - qe
     } else {
-        h[en0] = h[en0] + i32::from(v[en0]) - qe;
-    }
-    let mut max_h = h[en0];
-    let mut max_t = en0 as i32;
-
+        h[en0] + i32::from(v[en0]) - qe
+    };
+    h[en0] = h_en;
     let qe_v = _mm_set1_epi32(qe);
+    let lane = _mm_setr_epi32(0, 1, 2, 3);
+    let base = _mm_add_epi32(_mm_set1_epi32(st0 as i32), lane);
+    let mut idx = [
+        base,
+        _mm_add_epi32(base, _mm_set1_epi32(4)),
+        _mm_add_epi32(base, _mm_set1_epi32(8)),
+        _mm_add_epi32(base, _mm_set1_epi32(12)),
+    ];
+    let sixteen = _mm_set1_epi32(16);
+    let mut mx = [_mm_set1_epi32(i32::MIN); 4];
+    let mut mt = [_mm_set1_epi32(i32::MAX); 4];
     let mut t = st0;
-    while t + 4 <= en0 {
-        // SAFETY: bounds ensured by loop condition.
-        let hvec = unsafe { _mm_loadu_si128(h.as_ptr().add(t) as *const __m128i) };
-        // SAFETY: reading 4 bytes at `t` is in-bounds by loop condition.
-        let v4 = unsafe { ptr::read_unaligned(v.as_ptr().add(t) as *const u32) };
-        let vbytes = _mm_cvtsi32_si128(v4 as i32);
-        let v32 = _mm_cvtepu8_epi32(vbytes);
-        let updated = _mm_sub_epi32(_mm_add_epi32(hvec, v32), qe_v);
-        // SAFETY: bounds ensured by loop condition.
-        unsafe { _mm_storeu_si128(h.as_mut_ptr().add(t) as *mut __m128i, updated) };
-        let mx1 = _mm_max_epi32(updated, _mm_shuffle_epi32(updated, 0b10_11_00_01));
-        let mx2 = _mm_max_epi32(mx1, _mm_shuffle_epi32(mx1, 0b01_00_11_10));
-        let block_max = _mm_cvtsi128_si32(mx2);
-        if block_max > max_h {
-            max_h = block_max;
-            let mut vals = [0i32; 4];
-            // SAFETY: local fixed-size buffer.
-            unsafe { _mm_storeu_si128(vals.as_mut_ptr() as *mut __m128i, updated) };
-            for (i, &val) in vals.iter().enumerate() {
-                if val == block_max {
-                    max_t = (t + i) as i32;
-                    break;
-                }
-            }
+    assert!(en0 <= v.len() && en0 <= h.len());
+    while t + 16 <= en0 {
+        // SAFETY: `t + 16 <= en0`, within both `h` and `v` (asserted above).
+        let vb = unsafe { _mm_loadu_si128(v.as_ptr().add(t) as *const __m128i) };
+        let vw = [
+            _mm_cvtepu8_epi32(vb),
+            _mm_cvtepu8_epi32(_mm_srli_si128(vb, 4)),
+            _mm_cvtepu8_epi32(_mm_srli_si128(vb, 8)),
+            _mm_cvtepu8_epi32(_mm_srli_si128(vb, 12)),
+        ];
+        for k in 0..4 {
+            let hp = unsafe { h.as_mut_ptr().add(t + 4 * k) } as *mut __m128i;
+            let nh = _mm_sub_epi32(_mm_add_epi32(unsafe { _mm_loadu_si128(hp) }, vw[k]), qe_v);
+            unsafe { _mm_storeu_si128(hp, nh) };
+            let take = _mm_cmpgt_epi32(nh, mx[k]);
+            mx[k] = _mm_blendv_epi8(mx[k], nh, take);
+            mt[k] = _mm_blendv_epi8(mt[k], idx[k], take);
+            idx[k] = _mm_add_epi32(idx[k], sixteen);
         }
+        t += 16;
+    }
+    // Then 4 cells at a time into the first accumulator (see the NEON version).
+    let mut idx4 = _mm_add_epi32(_mm_set1_epi32(t as i32), lane);
+    while t + 4 <= en0 {
+        // SAFETY: `t + 4 <= en0`, within both `h` and `v` (asserted above).
+        let v4 = unsafe { (v.as_ptr().add(t) as *const i32).read_unaligned() };
+        let vw = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(v4));
+        let hp = unsafe { h.as_mut_ptr().add(t) } as *mut __m128i;
+        let nh = _mm_sub_epi32(_mm_add_epi32(unsafe { _mm_loadu_si128(hp) }, vw), qe_v);
+        unsafe { _mm_storeu_si128(hp, nh) };
+        let take = _mm_cmpgt_epi32(nh, mx[0]);
+        mx[0] = _mm_blendv_epi8(mx[0], nh, take);
+        mt[0] = _mm_blendv_epi8(mt[0], idx4, take);
+        idx4 = _mm_add_epi32(idx4, _mm_set1_epi32(4));
         t += 4;
     }
-    for idx in t..en0 {
-        h[idx] += i32::from(v[idx]) - qe;
-        if h[idx] > max_h {
-            max_h = h[idx];
-            max_t = idx as i32;
+    let (mut best, mut best_t) = (i32::MIN, i32::MAX);
+    if t > st0 {
+        let mut m4 = _mm_max_epi32(_mm_max_epi32(mx[0], mx[1]), _mm_max_epi32(mx[2], mx[3]));
+        m4 = _mm_max_epi32(m4, _mm_shuffle_epi32(m4, 0b01_00_11_10));
+        m4 = _mm_max_epi32(m4, _mm_shuffle_epi32(m4, 0b10_11_00_01));
+        let none = _mm_set1_epi32(i32::MAX);
+        let mut first = none;
+        for k in 0..4 {
+            first = _mm_min_epi32(first, _mm_blendv_epi8(none, mt[k], _mm_cmpeq_epi32(mx[k], m4)));
+        }
+        first = _mm_min_epi32(first, _mm_shuffle_epi32(first, 0b01_00_11_10));
+        first = _mm_min_epi32(first, _mm_shuffle_epi32(first, 0b10_11_00_01));
+        best = _mm_cvtsi128_si32(m4);
+        best_t = _mm_cvtsi128_si32(first);
+    }
+    // The tail follows every position above, so strict `>` keeps them first.
+    for k in t..en0 {
+        h[k] += i32::from(v[k]) - qe;
+        if h[k] > best {
+            best = h[k];
+            best_t = k as i32;
         }
     }
-    (max_h, max_t)
+    if best > h_en { (best, best_t) } else { (h_en, en0 as i32) }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn update_h_exact_avx2(
-    h: &mut [i32],
-    v: &[u8],
-    u: &[u8],
-    st0: usize,
-    en0: usize,
-    qe: i32,
-) -> (i32, i32) {
-    use ::core::ptr;
-    use std::arch::x86_64::*;
-
-    if en0 > 0 {
-        h[en0] = h[en0 - 1] + i32::from(u[en0]) - qe;
-    } else {
-        h[en0] = h[en0] + i32::from(v[en0]) - qe;
-    }
-    let mut max_h = h[en0];
-    let mut max_t = en0 as i32;
-
-    let qe_v = _mm256_set1_epi32(qe);
-    let mut t = st0;
-    while t + 8 <= en0 {
-        // SAFETY: bounds ensured by loop condition.
-        let hvec = unsafe { _mm256_loadu_si256(h.as_ptr().add(t) as *const __m256i) };
-        // SAFETY: reading 8 bytes at `t` is in-bounds by loop condition.
-        let v8 = unsafe { ptr::read_unaligned(v.as_ptr().add(t) as *const u64) };
-        let vbytes = _mm_cvtsi64_si128(v8 as i64);
-        let v32 = _mm256_cvtepu8_epi32(vbytes);
-        let updated = _mm256_sub_epi32(_mm256_add_epi32(hvec, v32), qe_v);
-        // SAFETY: bounds ensured by loop condition.
-        unsafe { _mm256_storeu_si256(h.as_mut_ptr().add(t) as *mut __m256i, updated) };
-        let hi = _mm256_extracti128_si256(updated, 1);
-        let lo = _mm256_castsi256_si128(updated);
-        let fold = _mm_max_epi32(lo, hi);
-        let mx1 = _mm_max_epi32(fold, _mm_shuffle_epi32(fold, 0b10_11_00_01));
-        let mx2 = _mm_max_epi32(mx1, _mm_shuffle_epi32(mx1, 0b01_00_11_10));
-        let block_max = _mm_cvtsi128_si32(mx2);
-        if block_max > max_h {
-            max_h = block_max;
-            let mut vals = [0i32; 8];
-            // SAFETY: local fixed-size buffer.
-            unsafe { _mm256_storeu_si256(vals.as_mut_ptr() as *mut __m256i, updated) };
-            for (i, &val) in vals.iter().enumerate() {
-                if val == block_max {
-                    max_t = (t + i) as i32;
-                    break;
-                }
-            }
-        }
-        t += 8;
-    }
-    for idx in t..en0 {
-        h[idx] += i32::from(v[idx]) - qe;
-        if h[idx] > max_h {
-            max_h = h[idx];
-            max_t = idx as i32;
-        }
-    }
-    (max_h, max_t)
-}
-
+/// NEON lane-wise exact-max row update.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn update_h_exact_neon(
+unsafe fn update_h_exact_lanes_neon(
     h: &mut [i32],
     v: &[u8],
     u: &[u8],
@@ -1092,65 +1076,78 @@ unsafe fn update_h_exact_neon(
 ) -> (i32, i32) {
     use std::arch::aarch64::*;
 
-    if en0 > 0 {
-        h[en0] = h[en0 - 1] + i32::from(u[en0]) - qe;
+    let h_en = if en0 > 0 {
+        h[en0 - 1] + i32::from(u[en0]) - qe
     } else {
-        h[en0] = h[en0] + i32::from(v[en0]) - qe;
-    }
-    let mut max_h = h[en0];
-    let mut max_t = en0 as i32;
-
+        h[en0] + i32::from(v[en0]) - qe
+    };
+    h[en0] = h_en;
     let qe_v = vdupq_n_s32(qe);
+    let lane = unsafe { vld1q_s32([0i32, 1, 2, 3].as_ptr()) };
+    let base = vaddq_s32(vdupq_n_s32(st0 as i32), lane);
+    let mut idx = [base, vaddq_s32(base, vdupq_n_s32(4)), vaddq_s32(base, vdupq_n_s32(8)), vaddq_s32(base, vdupq_n_s32(12))];
+    let sixteen = vdupq_n_s32(16);
+    let mut mx = [vdupq_n_s32(i32::MIN); 4];
+    let mut mt = [vdupq_n_s32(i32::MAX); 4];
     let mut t = st0;
-    while t + 8 <= en0 {
-        // SAFETY: bounds ensured by loop condition.
-        let v8 = unsafe { vld1_u8(v.as_ptr().add(t)) };
-        let v16 = vmovl_u8(v8);
-        let v32_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(v16)));
-        let v32_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(v16)));
-
-        // SAFETY: bounds ensured by loop condition.
-        let h_lo = unsafe { vld1q_s32(h.as_ptr().add(t)) };
-        // SAFETY: bounds ensured by loop condition.
-        let h_hi = unsafe { vld1q_s32(h.as_ptr().add(t + 4)) };
-        let out_lo = vsubq_s32(vaddq_s32(h_lo, v32_lo), qe_v);
-        let out_hi = vsubq_s32(vaddq_s32(h_hi, v32_hi), qe_v);
-        // SAFETY: bounds ensured by loop condition.
-        unsafe { vst1q_s32(h.as_mut_ptr().add(t), out_lo) };
-        // SAFETY: bounds ensured by loop condition.
-        unsafe { vst1q_s32(h.as_mut_ptr().add(t + 4), out_hi) };
-        let block_max = vmaxvq_s32(vmaxq_s32(out_lo, out_hi));
-        if block_max > max_h {
-            // Avoid spilling vectors to memory: probe lanes directly.
-            max_h = block_max;
-            if vgetq_lane_s32(out_lo, 0) == block_max {
-                max_t = t as i32;
-            } else if vgetq_lane_s32(out_lo, 1) == block_max {
-                max_t = (t + 1) as i32;
-            } else if vgetq_lane_s32(out_lo, 2) == block_max {
-                max_t = (t + 2) as i32;
-            } else if vgetq_lane_s32(out_lo, 3) == block_max {
-                max_t = (t + 3) as i32;
-            } else if vgetq_lane_s32(out_hi, 0) == block_max {
-                max_t = (t + 4) as i32;
-            } else if vgetq_lane_s32(out_hi, 1) == block_max {
-                max_t = (t + 5) as i32;
-            } else if vgetq_lane_s32(out_hi, 2) == block_max {
-                max_t = (t + 6) as i32;
-            } else {
-                max_t = (t + 7) as i32;
-            }
+    assert!(en0 <= v.len() && en0 <= h.len());
+    while t + 16 <= en0 {
+        // SAFETY: `t + 16 <= en0`, within both `h` and `v` (asserted above).
+        let vb = unsafe { vld1q_u8(v.as_ptr().add(t)) };
+        let (w_lo, w_hi) = (vmovl_u8(vget_low_u8(vb)), vmovl_high_u8(vb));
+        let vw = [
+            vmovl_u16(vget_low_u16(w_lo)),
+            vmovl_high_u16(w_lo),
+            vmovl_u16(vget_low_u16(w_hi)),
+            vmovl_high_u16(w_hi),
+        ];
+        for k in 0..4 {
+            let hp = unsafe { h.as_mut_ptr().add(t + 4 * k) };
+            let nh = vsubq_s32(vaddq_s32(unsafe { vld1q_s32(hp) }, vreinterpretq_s32_u32(vw[k])), qe_v);
+            unsafe { vst1q_s32(hp, nh) };
+            let take = vcgtq_s32(nh, mx[k]);
+            mx[k] = vbslq_s32(take, nh, mx[k]);
+            mt[k] = vbslq_s32(take, idx[k], mt[k]);
+            idx[k] = vaddq_s32(idx[k], sixteen);
         }
-        t += 8;
+        t += 16;
     }
-    for idx in t..en0 {
-        h[idx] += i32::from(v[idx]) - qe;
-        if h[idx] > max_h {
-            max_h = h[idx];
-            max_t = idx as i32;
+    // Then 4 cells at a time into the first accumulator: each lane still sees
+    // its positions in increasing order, so it still keeps the first maximum.
+    let mut idx4 = vaddq_s32(vdupq_n_s32(t as i32), lane);
+    while t + 4 <= en0 {
+        // SAFETY: `t + 4 <= en0`, within both `h` and `v` (asserted above).
+        let v4 = unsafe { (v.as_ptr().add(t) as *const u32).read_unaligned() };
+        let vw = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(v4)))));
+        let hp = unsafe { h.as_mut_ptr().add(t) };
+        let nh = vsubq_s32(vaddq_s32(unsafe { vld1q_s32(hp) }, vreinterpretq_s32_u32(vw)), qe_v);
+        unsafe { vst1q_s32(hp, nh) };
+        let take = vcgtq_s32(nh, mx[0]);
+        mx[0] = vbslq_s32(take, nh, mx[0]);
+        mt[0] = vbslq_s32(take, idx4, mt[0]);
+        idx4 = vaddq_s32(idx4, vdupq_n_s32(4));
+        t += 4;
+    }
+    let (mut best, mut best_t) = (i32::MIN, i32::MAX);
+    if t > st0 {
+        best = vmaxvq_s32(vmaxq_s32(vmaxq_s32(mx[0], mx[1]), vmaxq_s32(mx[2], mx[3])));
+        let mv = vdupq_n_s32(best);
+        let none = vdupq_n_s32(i32::MAX);
+        let mut first = none;
+        for k in 0..4 {
+            first = vminq_s32(first, vbslq_s32(vceqq_s32(mx[k], mv), mt[k], none));
+        }
+        best_t = vminvq_s32(first);
+    }
+    // The tail follows every position above, so strict `>` keeps them first.
+    for k in t..en0 {
+        h[k] += i32::from(v[k]) - qe;
+        if h[k] > best {
+            best = h[k];
+            best_t = k as i32;
         }
     }
-    (max_h, max_t)
+    if best > h_en { (best, best_t) } else { (h_en, en0 as i32) }
 }
 
 #[inline(always)]
@@ -1740,7 +1737,7 @@ impl BackendOps for Sse41Ops {
     ) -> (i32, i32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            update_h_exact_sse41(h, v, u, st0, en0, qe)
+            update_h_exact_lanes_sse41(h, v, u, st0, en0, qe)
         }
         #[cfg(not(target_arch = "x86_64"))]
         update_h_exact_scalar(h, v, u, st0, en0, qe)
@@ -1852,7 +1849,7 @@ impl BackendOps for Avx2Ops {
     ) -> (i32, i32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            update_h_exact_avx2(h, v, u, st0, en0, qe)
+            update_h_exact_lanes_sse41(h, v, u, st0, en0, qe)
         }
         #[cfg(not(target_arch = "x86_64"))]
         update_h_exact_scalar(h, v, u, st0, en0, qe)
@@ -2005,7 +2002,7 @@ impl BackendOps for NeonOps {
     ) -> (i32, i32) {
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            update_h_exact_neon(h, v, u, st0, en0, qe)
+            update_h_exact_lanes_neon(h, v, u, st0, en0, qe)
         }
         #[cfg(not(target_arch = "aarch64"))]
         update_h_exact_scalar(h, v, u, st0, en0, qe)
@@ -2580,6 +2577,44 @@ pub(super) fn extz2_core<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lane-wise exact-max update must match `update_h_exact_scalar`
+    /// exactly, ties included (the first position of the maximum wins, and
+    /// `h[en0]` wins unless strictly beaten). Small value ranges force ties.
+    #[test]
+    fn lane_exact_max_matches_scalar() {
+        #[allow(unused_mut)]
+        let mut kernels: Vec<(&str, fn(&mut [i32], &[u8], &[u8], usize, usize, i32) -> (i32, i32))> = Vec::new();
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            kernels.push(("neon", |h, v, u, st0, en0, qe| unsafe { update_h_exact_lanes_neon(h, v, u, st0, en0, qe) }));
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("sse4.1") {
+            kernels.push(("sse4.1", |h, v, u, st0, en0, qe| unsafe { update_h_exact_lanes_sse41(h, v, u, st0, en0, qe) }));
+        }
+        let mut seed = 7u64;
+        let mut next = move |m: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        for (name, kernel) in kernels {
+            for _ in 0..20_000 {
+                let len = 1 + next(80) as usize;
+                let st0 = next(len as u64) as usize;
+                let en0 = st0 + next((len - st0) as u64) as usize;
+                let span = 1 + next(6) as i32;
+                let h0: Vec<i32> = (0..len).map(|_| next(span as u64) as i32 - span / 2).collect();
+                let v: Vec<u8> = (0..len).map(|_| next(4) as u8).collect();
+                let u: Vec<u8> = (0..len).map(|_| next(4) as u8).collect();
+                let qe = next(4) as i32;
+                let (mut ha, mut hb) = (h0.clone(), h0);
+                let want = update_h_exact_scalar(&mut ha, &v, &u, st0, en0, qe);
+                let got = kernel(&mut hb, &v, &u, st0, en0, qe);
+                assert_eq!((got, &hb), (want, &ha), "{name}: st0={st0} en0={en0}");
+            }
+        }
+    }
 
     fn mm_mat(match_score: i8, mismatch_score: i8) -> [i8; 25] {
         let mut mat = [mismatch_score; 25];
