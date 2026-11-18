@@ -1,6 +1,9 @@
 #![cfg(has_c_ref)]
 
-use ksw2rs::{Extz, Extz2Input, KSW_EZ_SCORE_ONLY, extz2};
+use ksw2rs::{
+    Extz, Extz2Input, KSW_EZ_EXTZ_ONLY, KSW_EZ_GENERIC_SC, KSW_EZ_REV_CIGAR, KSW_EZ_RIGHT,
+    KSW_EZ_SCORE_ONLY, extz2,
+};
 
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -160,4 +163,104 @@ fn differential_cigar_simple_case() {
     assert_eq!(rz.score, cz.score);
     assert_eq!(rz.cigar.len() as u32, cz.n_cigar);
     assert_eq!(rh, cz.cigar_hash);
+}
+
+/// Banded alignments, with and without CIGAR and with the full scoring
+/// matrix, against C. At a band edge both implementations read padding cells
+/// past the band, so the padding has to match too.
+///
+/// Compared: everything that does not depend on which of several equal
+/// maxima is reported. C reduces its four SIMD lanes lowest lane first,
+/// ksw2rs reports the first position, so `max_t`/`max_q` (and what follows
+/// from them: z-drop, the CIGAR of an extension that stops at the maximum)
+/// may differ on ties. Z-drop is therefore off here.
+#[test]
+fn differential_banded_randomized() {
+    let mut seed = 0x0123_4567_89AB_CDEFu64;
+    let flags = [
+        KSW_EZ_SCORE_ONLY,
+        KSW_EZ_SCORE_ONLY | KSW_EZ_RIGHT,
+        0,
+        KSW_EZ_RIGHT,
+        KSW_EZ_REV_CIGAR,
+        KSW_EZ_EXTZ_ONLY,
+        KSW_EZ_GENERIC_SC,
+        KSW_EZ_GENERIC_SC | KSW_EZ_RIGHT,
+        KSW_EZ_SCORE_ONLY | KSW_EZ_GENERIC_SC,
+    ];
+    for case in 0..20_000 {
+        let qlen = (lcg(&mut seed) % 200 + 1) as usize;
+        let tlen = (qlen as i64 + (lcg(&mut seed) % 31) as i64 - 15).max(1) as usize;
+        let t: Vec<u8> = (0..tlen).map(|_| (lcg(&mut seed) % 4) as u8).collect();
+        // the query follows the target, with substitutions and short indels
+        let mut q = Vec::with_capacity(qlen + 4);
+        let mut i = 0;
+        while q.len() < qlen {
+            match if i < tlen { lcg(&mut seed) % 30 } else { 0 } {
+                0 => {
+                    q.push((lcg(&mut seed) % 4) as u8);
+                    i += 1;
+                }
+                1 => i += 1 + (lcg(&mut seed) % 4) as usize,
+                2 => {
+                    for _ in 0..1 + lcg(&mut seed) % 4 {
+                        q.push((lcg(&mut seed) % 4) as u8);
+                    }
+                }
+                _ => {
+                    q.push(t[i]);
+                    i += 1;
+                }
+            }
+        }
+        q.truncate(qlen);
+
+        let mat = dna5_mat([2, 1, 5][(lcg(&mut seed) % 3) as usize], -4);
+        let flag = flags[(lcg(&mut seed) % flags.len() as u32) as usize];
+        let input = Extz2Input {
+            query: &q,
+            target: &t,
+            m: 5,
+            mat: &mat,
+            q: [4, 6, 12][(lcg(&mut seed) % 3) as usize],
+            e: [1, 2, 3][(lcg(&mut seed) % 3) as usize],
+            w: [-1, 1, 4, 15, 15, 31][(lcg(&mut seed) % 6) as usize],
+            zdrop: -1,
+            end_bonus: 0,
+            flag,
+        };
+
+        let mut rz = Extz::default();
+        extz2(&input, &mut rz);
+        let cz = run_c_ref(&input);
+
+        let what = format!(
+            "case {case}: qlen={qlen} tlen={tlen} w={} flag={flag:#x}",
+            input.w
+        );
+        assert_eq!(
+            (
+                rz.score,
+                rz.mqe,
+                rz.mqe_t,
+                rz.mte,
+                rz.mte_q,
+                rz.zdropped as i32
+            ),
+            (cz.score, cz.mqe, cz.mqe_t, cz.mte, cz.mte_q, cz.zdropped),
+            "{what}"
+        );
+        // A full alignment is traced back from the end cell, whatever the
+        // maximum was. (An alignment that left the band is `zdropped`.)
+        if flag & (KSW_EZ_SCORE_ONLY | KSW_EZ_EXTZ_ONLY) == 0 && !rz.zdropped {
+            let rh = rz.cigar.iter().fold(1469598103934665603u64, |acc, &x| {
+                (acc ^ x as u64).wrapping_mul(1099511628211)
+            });
+            assert_eq!(
+                (rz.cigar.len() as u32, rh),
+                (cz.n_cigar, cz.cigar_hash),
+                "{what}"
+            );
+        }
+    }
 }

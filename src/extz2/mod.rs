@@ -94,6 +94,16 @@ impl Extz {
 }
 
 /// Input bundle for `extz2`.
+///
+/// Cell values are stored in 8 bits, as in KSW2, which bounds the scoring
+/// scheme: with `max_sc` and `min_sc` the largest and smallest entries of
+/// `mat`, an alignment is computed only if `-min_sc <= 2 * (q + e)` and
+/// `max_sc + 2 * (q + e) <= 255`. Otherwise the result is left reset
+/// (`score == KSW_NEG_INF`, empty CIGAR). Schemes with
+/// `max_sc + 2 * (q + e) > 127` run on the scalar kernel.
+///
+/// A negative `w` disables banding, as does any `w` at least as large as the
+/// longer sequence.
 #[derive(Debug, Clone)]
 pub struct Extz2Input<'a> {
     pub query: &'a [u8],
@@ -115,17 +125,20 @@ pub struct Extz2Input<'a> {
 ///
 /// The seven byte-sized DP arrays (u, v, x, y, s, sf, qr) are packed into a
 /// single contiguous allocation (`buf`) in the same layout that the C reference
-/// uses: `[u | v | x | y | s | sf | qr+16_pad]`.  This gives better cache and
-/// TLB behaviour than seven separate `Vec` allocations, and the 16-byte
+/// uses: `[u | v | x | y | s | sf | qr+32_pad]`.  This gives better cache and
+/// TLB behaviour than seven separate `Vec` allocations, and the 32-byte
 /// overshoot beyond `qr` means the SIMD score-fill kernels never need a
 /// per-chunk bounds check.
 #[derive(Debug, Default, Clone)]
 pub struct Workspace {
-    /// Flat buffer: `6 * tlen_pad + qlen_pad + 16` bytes, zeroed on resize.
+    /// Flat buffer: `6 * tlen_pad + qlen_pad + 32` bytes, zeroed on resize.
     buf: Vec<u8>,
+    /// Exact-path scores, `tlen` cells plus padding to a whole 4-cell group.
     h: Vec<i32>,
     off: Vec<i32>,
     off_end: Vec<i32>,
+    /// Traceback matrix. Only ever grown: every cell that is read was written
+    /// by the same alignment, so stale contents are never observed.
     p: Vec<u8>,
     /// Cached layout dimensions set by the most recent `prepare_*` call.
     tlen_pad: usize,
@@ -135,23 +148,24 @@ pub struct Workspace {
 impl Workspace {
     /// Prepare the flat buffer for a score-only alignment.
     ///
-    /// Layout: `[u | v | x | y | s | sf | qr+16]`, all zero-initialised once.
-    /// The trailing 16-byte pad on `qr` (and the implicit pad provided by `qr`
-    /// after `sf`) means SIMD score-fill kernels can always load 16 bytes
+    /// Layout: `[u | v | x | y | s | sf | qr+32]`, all zero-initialised once.
+    /// The trailing 32-byte pad on `qr` (and the implicit pad provided by `qr`
+    /// after `sf`) means SIMD score-fill kernels can always load whole blocks
     /// without a per-chunk bounds check.
     #[inline]
     fn prepare_score_only(&mut self, qlen: usize, tlen: usize, approx: bool) {
         let tlen_pad = tlen.div_ceil(16) * 16;
         let qlen_pad = qlen.div_ceil(16) * 16;
-        // 6 tlen_pad-wide arrays (u,v,x,y,s,sf) plus qr with a 16-byte pad.
-        let total = 6 * tlen_pad + qlen_pad + 16;
+        // 6 tlen_pad-wide arrays (u,v,x,y,s,sf) plus qr with a 32-byte pad.
+        let total = 6 * tlen_pad + qlen_pad + 32;
         self.buf.clear();
         self.buf.resize(total, 0u8);
         self.tlen_pad = tlen_pad;
         self.qlen_pad = qlen_pad;
         if !approx {
             self.h.clear();
-            self.h.resize(tlen, KSW_NEG_INF);
+            // padded so the SIMD row update can work on whole 4-cell groups
+            self.h.resize(tlen + 3, KSW_NEG_INF);
         } else {
             self.h.clear();
         }
@@ -171,14 +185,12 @@ impl Workspace {
         self.off.resize(rows, 0);
         self.off_end.clear();
         self.off_end.resize(rows, 0);
+        // The traceback matrix is fully written per active row span by the DP
+        // kernels before any read, so it is only grown, never cleared.
         let p_len = rows * n_col;
-        self.p.clear();
-        self.p.reserve(p_len);
-        // SAFETY: clear() above sets len to 0, so reserve(p_len) guarantees
-        // capacity >= p_len.  The traceback matrix is fully written per active
-        // row span by the DP kernels before any read, so leaving bytes
-        // uninitialised is safe.
-        unsafe { self.p.set_len(p_len) };
+        if self.p.len() < p_len {
+            self.p.resize(p_len, 0);
+        }
     }
 }
 
@@ -201,13 +213,14 @@ pub fn extz2_with_workspace(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Work
 /// This is primarily useful for benchmarking and differential debugging.
 pub fn extz2_scalar(input: &Extz2Input<'_>, ez: &mut Extz) {
     let mut ws = Workspace::default();
-    core::extz2_core::<core::ScalarOps>(input, ez, &mut ws);
+    extz2_scalar_with_workspace(input, ez, &mut ws);
 }
 
 /// Force the scalar backend while reusing caller-provided workspace.
 #[inline]
 pub fn extz2_scalar_with_workspace(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
-    core::extz2_core::<core::ScalarOps>(input, ez, ws);
+    // SAFETY: the scalar kernel needs no target feature.
+    unsafe { extz2_scalar_kernel(input, ez, ws) }
 }
 
 /// A resolved alignment kernel: the score-fill implementation specialized for a
@@ -220,6 +233,8 @@ pub fn extz2_scalar_with_workspace(input: &Extz2Input<'_>, ez: &mut Extz, ws: &m
 pub type KernelFn = unsafe fn(&Extz2Input<'_>, &mut Extz, &mut Workspace);
 
 /// Scalar kernel, wrapped to share the [`KernelFn`] signature with the SIMD ones.
+/// The one copy of the scalar core: the SIMD kernels fall back to it too.
+#[inline(never)]
 unsafe fn extz2_scalar_kernel(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
     core::extz2_core::<core::ScalarOps>(input, ez, ws);
 }
@@ -268,21 +283,36 @@ fn extz2_dispatch(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
     unsafe { (cached_kernel())(input, ez, ws) }
 }
 
+// The SIMD kernels compare transformed scores as signed bytes. Scoring schemes
+// outside that range (see `core::fits_simd`) take the scalar kernel instead.
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn extz2_avx2(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
+    if !core::fits_simd(input) {
+        // SAFETY: the scalar kernel needs no target feature.
+        return unsafe { extz2_scalar_kernel(input, ez, ws) };
+    }
     core::extz2_core::<core::Avx2Ops>(input, ez, ws);
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn extz2_sse41(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
+    if !core::fits_simd(input) {
+        // SAFETY: the scalar kernel needs no target feature.
+        return unsafe { extz2_scalar_kernel(input, ez, ws) };
+    }
     core::extz2_core::<core::Sse41Ops>(input, ez, ws);
 }
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn extz2_neon(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
+    if !core::fits_simd(input) {
+        // SAFETY: the scalar kernel needs no target feature.
+        return unsafe { extz2_scalar_kernel(input, ez, ws) };
+    }
     core::extz2_core::<core::NeonOps>(input, ez, ws);
 }
 
