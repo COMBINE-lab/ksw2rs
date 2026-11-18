@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main, release-prep]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.build }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # x86-64 (SSE4.1/AVX2 kernels) and aarch64 (NEON kernel)
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+        # native: the repository's .cargo/config.toml (target-cpu=native);
+        # portable: baseline target features with runtime dispatch, as a
+        # dependent crate builds it
+        build: [native, portable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Use baseline target features
+        if: matrix.build == 'portable'
+        run: echo "RUSTFLAGS=-C debuginfo=0" >> "$GITHUB_ENV"
+      - name: Test (release)
+        run: cargo test --release
+      - name: Test (debug, overflow checks)
+        run: cargo test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets
