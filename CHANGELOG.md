@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-11-19)
 
 NEON only; results and the x86-64 kernels are unchanged.
 
@@ -8,7 +8,7 @@ NEON only; results and the x86-64 kernels are unchanged.
 is fixed, and the exact path is faster. Time relative to 0.2.1 on an Apple M5
 Max (native build, one core, workspace at a fixed page offset):
 
-| workload | 0.3.0 | this version |
+| workload | 0.3.0 | 0.3.1 |
 |---|---|---|
 | score-only exact, 150×165, w=15 | 1.05× | 1.20× |
 | CIGAR, 150×165, w=15 | 1.02× | 1.15× |
@@ -17,6 +17,11 @@ Max (native build, one core, workspace at a fixed page offset):
 | `KSW_EZ_NO_MAX`, 150×165, w=15 | 0.94× | 1.01× |
 | `KSW_EZ_NO_MAX`, 150×165, full band | 0.92× | 0.99× |
 | `KSW_EZ_APPROX_MAX`, 150×165, full band | 0.96× | 0.98× |
+
+On short extensions (targets of 30–60 bases, band 3–32, the shape of salmon's
+default calls), 0.3.1 against 0.2.1 on the same machine: `KSW_EZ_NO_MAX`
+1.01×, score-only exact 1.40×, CIGAR 1.34×. With targets of 17–32 bases,
+`KSW_EZ_NO_MAX` is at parity.
 
 - The `KSW_EZ_NO_MAX` row update is inlined into the anti-diagonal loop on
   aarch64; the call made the loop spill and reload its vector constants on
