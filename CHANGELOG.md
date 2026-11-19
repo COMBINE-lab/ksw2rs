@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+NEON only; results and the x86-64 kernels are unchanged.
+
+0.3.0 was 4–8% slower than 0.2.1 on Apple Silicon with `KSW_EZ_NO_MAX`. That
+is fixed, and the exact path is faster. Time relative to 0.2.1 on an Apple M5
+Max (native build, one core, workspace at a fixed page offset):
+
+| workload | 0.3.0 | this version |
+|---|---|---|
+| score-only exact, 150×165, w=15 | 1.05× | 1.20× |
+| CIGAR, 150×165, w=15 | 1.02× | 1.15× |
+| score-only exact, 150×165, full band | 1.56× | 1.71× |
+| score-only, z-drop, 1000×1100, full band | 1.41× | 1.43× |
+| `KSW_EZ_NO_MAX`, 150×165, w=15 | 0.94× | 1.01× |
+| `KSW_EZ_NO_MAX`, 150×165, full band | 0.92× | 0.99× |
+| `KSW_EZ_APPROX_MAX`, 150×165, full band | 0.96× | 0.98× |
+
+- The `KSW_EZ_NO_MAX` row update is inlined into the anti-diagonal loop on
+  aarch64; the call made the loop spill and reload its vector constants on
+  every row.
+- The exact row update is inlined too, and its lanes start at the first cell
+  of the row instead of at a multiple of four (the update of #4).
+- The score fill no longer masks its first and last block. Narrow rows use a
+  plain 16-cell loop; wide rows keep aligned stores between an unaligned first
+  and last chunk.
+
 ## 0.3.0 (2026-11-18)
 
 No API signatures change, but some results do; see "Changed results".
