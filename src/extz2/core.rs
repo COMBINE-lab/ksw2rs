@@ -123,9 +123,10 @@ pub(super) fn fits_simd(input: &Extz2Input<'_>) -> bool {
 // `[st0, st0 + 16k)`, with `k` the number of 16-cell chunks needed to reach
 // `en0`, as the C reference does: the cells past `en0` are padding, but the
 // next anti-diagonal reads them when the band edge moves, so the padding is
-// part of the result. `sfqr` is `sf` followed by `qr` (`sf` is `s.len()`
+// part of the result. `sfqr` is `sf` followed by `qr` (`sf` is `tlen_pad`
 // long): target cell `t` is `sfqr[t]`, and past the end of `sf` the fill runs
-// on into `qr`, again as in C.
+// on into `qr`, again as in C. `s` is `tlen_pad + S_SLACK` long; a chunk that
+// starts below `tlen_pad` may run on into the slack, or stop at `tlen_pad`.
 
 #[inline]
 fn fill_scores_fast_row_scalar(
@@ -139,7 +140,7 @@ fn fill_scores_fast_row_scalar(
     sc_n: i8,
     s: &mut [i8],
 ) {
-    let tlen_pad = s.len();
+    let tlen_pad = s.len() - S_SLACK;
     let end = (st0 + ((en0 - st0) / 16 + 1) * 16).min(tlen_pad);
     for idx in st0..end {
         let sq = sfqr[idx];
@@ -163,7 +164,7 @@ fn fill_scores_fast_row_scalar(
 // ends after `st0 + 16k`; the cells outside keep their previous contents.
 
 /// `LOW_BYTES[16 - n..]` starts with `n` bytes set, for `n` in `0..=16`.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 static LOW_BYTES: [i8; 32] = {
     let mut m = [0i8; 32];
     let mut i = 0;
@@ -179,8 +180,9 @@ static LOW_BYTES: [i8; 32] = {
 /// it the first `n` cells are the ones written (`n` in `0..=16`).
 ///
 /// # Safety
-/// `t + 16 <= s.len()`, and `sfqr` holds 16 bytes at both `t` and
-/// `s.len() + qrr_base + t` (the latter may start up to 15 bytes before `qr`).
+/// `t + 16 <= tlen_pad` (`s.len() - S_SLACK`), and `sfqr` holds 16 bytes at
+/// both `t` and `tlen_pad + qrr_base + t` (the latter may start up to 15 bytes
+/// before `qr`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 #[inline]
@@ -198,8 +200,9 @@ unsafe fn fill_scores_partial_block_sse41<const KEEP_LOW: bool>(
     use std::arch::x86_64::*;
 
     let wc = _mm_set1_epi8(wildcard as i8);
-    let qpos = (s.len() as isize + qrr_base as isize + t as isize) as usize;
-    debug_assert!(n <= 16 && t + 16 <= s.len() && qpos + 16 <= sfqr.len());
+    let tlen_pad = s.len() - S_SLACK;
+    let qpos = (tlen_pad as isize + qrr_base as isize + t as isize) as usize;
+    debug_assert!(n <= 16 && t + 16 <= tlen_pad && qpos + 16 <= sfqr.len());
     // SAFETY: both loads are inside `sfqr`, `sp` inside `s` (see above).
     let sq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(t) as *const __m128i) };
     let qq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(qpos) as *const __m128i) };
@@ -238,7 +241,7 @@ unsafe fn fill_scores_fast_row_avx2(
 ) {
     use std::arch::x86_64::*;
 
-    let tlen_pad = s.len();
+    let tlen_pad = s.len() - S_SLACK;
     let end = st0 + ((en0 - st0) / 16 + 1) * 16;
     let lim = end.min(tlen_pad);
     // The last byte any block below reads from `qr` is at most cell
@@ -334,7 +337,7 @@ unsafe fn fill_scores_fast_row_sse41(
 ) {
     use std::arch::x86_64::*;
 
-    let tlen_pad = s.len();
+    let tlen_pad = s.len() - S_SLACK;
     let end = st0 + ((en0 - st0) / 16 + 1) * 16;
     let lim = end.min(tlen_pad);
     // see `fill_scores_fast_row_avx2`
@@ -398,64 +401,22 @@ unsafe fn fill_scores_fast_row_sse41(
     }
 }
 
-/// NEON counterpart of [`fill_scores_partial_block_sse41`].
+/// NEON score fill: writes the cells `[st0, st0 + 16k)` (see the notes above
+/// `fill_scores_fast_row_scalar`) in whole 16-cell stores, the last of which
+/// may run on into the slack of `s`.
+///
+/// Narrow rows (at most two chunks, the banded case) are chunks from `st0`
+/// while `t <= en0`, with no per-row setup. Wider rows store the chunk at
+/// `st0`, the one ending at `st0 + 16k`, then the whole 16-cell blocks between
+/// them, so that each block the DP kernel loads is forwarded from a single
+/// store. On Apple cores the per-row instruction count of narrow rows matters
+/// more than that forwarding; on wide rows the aligned blocks win.
 ///
 /// # Safety
-/// `t + 16 <= s.len()`, and `sfqr` holds 16 bytes at both `t` and
-/// `s.len() + qrr_base + t` (the latter may start up to 15 bytes before `qr`).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[inline]
-unsafe fn fill_scores_partial_block_neon<const KEEP_LOW: bool>(
-    sfqr: &[u8],
-    qrr_base: i32,
-    t: usize,
-    n: usize,
-    wildcard: u8,
-    sc_mch: i8,
-    sc_mis: i8,
-    sc_n: i8,
-    s: &mut [i8],
-) {
-    use std::arch::aarch64::*;
-
-    let wc = vdupq_n_u8(wildcard);
-    let qpos = (s.len() as isize + qrr_base as isize + t as isize) as usize;
-    debug_assert!(n <= 16 && t + 16 <= s.len() && qpos + 16 <= sfqr.len());
-    // SAFETY: both loads are inside `sfqr`, `sp` inside `s` (see above).
-    let sq = unsafe { vld1q_u8(sfqr.as_ptr().add(t)) };
-    let qq = unsafe { vld1q_u8(sfqr.as_ptr().add(qpos)) };
-    let sp = unsafe { s.as_mut_ptr().add(t) };
-    let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
-    let eq = vceqq_u8(sq, qq);
-    let tmp = vbslq_s8(eq, vdupq_n_s8(sc_mch), vdupq_n_s8(sc_mis));
-    let tmp = vbslq_s8(mask_wc, vdupq_n_s8(sc_n), tmp);
-    // SAFETY: `16 - n..16 - n + 16` is inside the 32-byte table.
-    let low = unsafe { vld1q_u8(LOW_BYTES.as_ptr().add(16 - n) as *const u8) };
-    let old = unsafe { vld1q_s8(sp) };
-    let tmp = if KEEP_LOW {
-        vbslq_s8(low, old, tmp)
-    } else {
-        vbslq_s8(low, tmp, old)
-    };
-    unsafe { vst1q_s8(sp, tmp) };
-}
-
-/// NEON score fill: writes exactly the cells `[st0, min(end, s.len()))` (see
-/// the notes above `fill_scores_fast_row_scalar`), 16 per store.
-///
-/// Narrow rows (at most two chunks, the banded case) go as in 0.2.1: chunks
-/// from `st0` while `t <= en0`, with no per-row setup. A chunk that would
-/// leave `s` (last rows only) is a masked block instead. Wider rows store the
-/// chunk at `st0`, the one ending at `end`, then the whole 16-cell blocks
-/// between them, so that each block the DP kernel loads is forwarded from a
-/// single store. On Apple cores the per-row instruction count of narrow rows
-/// matters more than that forwarding; on wide rows the aligned blocks win.
-///
-/// # Safety
-/// `st0 <= en0 < s.len()`, `qrr_base + st0 >= 0`, and
-/// `s.len() + qrr_base + en0 + 31 <= sfqr.len()` (as for the x86 fills; the
-/// score-only and traceback cores guarantee it by construction).
+/// With `tlen_pad = s.len() - S_SLACK`: `st0 <= en0 < tlen_pad`,
+/// `qrr_base + st0 >= 0`, and `tlen_pad + qrr_base + en0 + 31 <= sfqr.len()`
+/// (as for the x86 fills; the score-only and traceback cores guarantee it by
+/// construction).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -472,7 +433,7 @@ unsafe fn fill_scores_fast_row_neon(
 ) {
     use std::arch::aarch64::*;
 
-    let tlen_pad = s.len();
+    let tlen_pad = s.len() - S_SLACK;
     // the caller guarantees these (see the safety section above)
     debug_assert!(
         st0 <= en0
@@ -488,61 +449,33 @@ unsafe fn fill_scores_fast_row_neon(
     let tp = sfqr.as_ptr();
     // `qp + t` is the query cell of target cell `t` (`qrr_base + t >= 0`)
     let qp = unsafe { sfqr.as_ptr().add(tlen_pad).offset(qrr_base as isize) };
-    // the last 16-cell block of `s` (`tlen_pad` is a nonzero multiple of 16)
-    let last = tlen_pad - 16;
-    let mut t = st0;
-    if en0 - st0 >= 32 && st0 + ((en0 - st0) / 16 + 1) * 16 <= tlen_pad {
-        // A wide row inside `s`: the chunk at `st0`, the one ending at `end`,
-        // then the whole 16-cell blocks between them, each in one store, so
-        // that the DP kernel's load of each block is forwarded from one store
-        // (cells covered twice get the same value twice).
+    // SAFETY: called with `st0 <= t <= en0 < tlen_pad` or `t + 16 <= end`,
+    // and `end <= en0 + 16`: the store ends inside `s` (`S_SLACK` is 16), the
+    // loads inside `sfqr` (safety section above).
+    let chunk = |t: usize| unsafe {
+        let sq = vld1q_u8(tp.add(t));
+        let qq = vld1q_u8(qp.add(t));
+        let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
+        let tmp = vbslq_s8(vceqq_u8(sq, qq), mch, mis);
+        vst1q_s8(sp.add(t), vbslq_s8(mask_wc, nsc, tmp));
+    };
+    if en0 - st0 >= 32 {
+        // A wide row: the chunk at `st0`, the one ending at `end`, then the
+        // whole 16-cell blocks between them (cells covered twice get the same
+        // value twice).
         let end = st0 + ((en0 - st0) / 16 + 1) * 16;
-        // SAFETY: `st0 <= t` and `t + 16 <= end <= tlen_pad` for each store,
-        // the loads inside `sfqr` (safety section above).
-        let chunk = |t: usize| unsafe {
-            let sq = vld1q_u8(tp.add(t));
-            let qq = vld1q_u8(qp.add(t));
-            let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
-            let tmp = vbslq_s8(vceqq_u8(sq, qq), mch, mis);
-            vst1q_s8(sp.add(t), vbslq_s8(mask_wc, nsc, tmp));
-        };
         chunk(st0);
         chunk(end - 16);
-        t = (st0 + 16) & !15;
+        let mut t = (st0 + 16) & !15;
         while t + 16 < end {
             chunk(t);
             t += 16;
         }
         return;
     }
+    let mut t = st0;
     while t <= en0 {
-        if t > last {
-            // SAFETY: `last < t <= en0 < tlen_pad`; the cells `[t, tlen_pad)`
-            // are the last ones of the row.
-            unsafe {
-                fill_scores_partial_block_neon::<true>(
-                    sfqr,
-                    qrr_base,
-                    last,
-                    t - last,
-                    wildcard,
-                    sc_mch,
-                    sc_mis,
-                    sc_n,
-                    s,
-                )
-            };
-            break;
-        }
-        // SAFETY: `st0 <= t <= last`: the store is inside `s`, the loads
-        // inside `sfqr` (safety section above).
-        unsafe {
-            let sq = vld1q_u8(tp.add(t));
-            let qq = vld1q_u8(qp.add(t));
-            let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
-            let tmp = vbslq_s8(vceqq_u8(sq, qq), mch, mis);
-            vst1q_s8(sp.add(t), vbslq_s8(mask_wc, nsc, tmp));
-        }
+        chunk(t);
         t += 16;
     }
 }
@@ -1720,13 +1653,21 @@ pub(super) trait BackendOps {
     ) -> (i32, i32);
 }
 
+/// Cells of `s` after `tlen_pad`: room for a whole 16-cell store starting at
+/// any cell below `tlen_pad`, so a score fill that works in chunks from `st0`
+/// need not clip its last one. Never read.
+pub(super) const S_SLACK: usize = 16;
+
 /// Carve the flat `Workspace::buf` into the named DP slices.
 ///
-/// Layout: `[u | v | x | y | s | sf | qr+32]`, matching the C reference.
+/// Layout: `[u | v | x | y | s+16 | sf | qr+32]`: the C reference's, plus
+/// `S_SLACK` cells after `s`.
 /// The `s` slice is re-interpreted as `&mut [i8]` (same size/alignment as
 /// `u8`).  All returned slices are non-overlapping sub-slices of `buf`.
 /// `sf` and `qr` come back as one slice, `sfqr`: the score fill reads across
 /// their boundary (`sf` is `tlen_pad` long).
+///
+/// `s` is `tlen_pad + S_SLACK` long.
 #[inline]
 pub(super) fn split_main_buf(
     buf: &mut [u8],
@@ -1744,10 +1685,10 @@ pub(super) fn split_main_buf(
     let (v, rest) = rest.split_at_mut(tlen_pad);
     let (x, rest) = rest.split_at_mut(tlen_pad);
     let (y, rest) = rest.split_at_mut(tlen_pad);
-    let (s_raw, rest) = rest.split_at_mut(tlen_pad);
+    let (s_raw, rest) = rest.split_at_mut(tlen_pad + S_SLACK);
     let (sfqr, _) = rest.split_at_mut(tlen_pad + qlen_pad + 32);
     // SAFETY: i8 has the same size and alignment as u8; the slice is valid.
-    let s = unsafe { std::slice::from_raw_parts_mut(s_raw.as_mut_ptr() as *mut i8, tlen_pad) };
+    let s = unsafe { std::slice::from_raw_parts_mut(s_raw.as_mut_ptr() as *mut i8, s_raw.len()) };
     (u, v, x, y, s, sfqr)
 }
 

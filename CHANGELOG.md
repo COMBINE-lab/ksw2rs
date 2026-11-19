@@ -26,6 +26,10 @@ Max (native build, one core, workspace at a fixed page offset):
 - The score fill no longer masks its first and last block. Narrow rows use a
   plain 16-cell loop; wide rows keep aligned stores between an unaligned first
   and last chunk.
+- The score row has 16 cells of slack after it, so the fill never clips its
+  last chunk at the end of the row. On short targets (salmon's default
+  extensions are a few dozen bases) most rows ended in a clipped, masked store
+  (found and fixed by @BenjaminDEMAILLE).
 
 ## 0.3.0 (2026-11-18)
 
