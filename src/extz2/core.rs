@@ -111,10 +111,25 @@ fn apply_zdrop(ez: &mut Extz, h: i32, a: i32, b: i32, zdrop: i32, e: i8) -> bool
     false
 }
 
+/// True when the transformed scores fit the signed 8-bit comparisons of the
+/// SIMD kernels. The scalar kernel computes in 32 bits and stores unsigned
+/// bytes, so it is exact up to 255.
+pub(super) fn fits_simd(input: &Extz2Input<'_>) -> bool {
+    let max_sc = input.mat.iter().copied().max().map_or(0, i32::from);
+    max_sc + 2 * (i32::from(input.q) + i32::from(input.e)) <= 127
+}
+
+// Fast-path score fill. Every backend writes exactly the cells
+// `[st0, st0 + 16k)`, with `k` the number of 16-cell chunks needed to reach
+// `en0`, as the C reference does: the cells past `en0` are padding, but the
+// next anti-diagonal reads them when the band edge moves, so the padding is
+// part of the result. `sfqr` is `sf` followed by `qr` (`sf` is `s.len()`
+// long): target cell `t` is `sfqr[t]`, and past the end of `sf` the fill runs
+// on into `qr`, again as in C.
+
 #[inline]
 fn fill_scores_fast_row_scalar(
-    sf: &[u8],
-    qr: &[u8],
+    sfqr: &[u8],
     qrr_base: i32,
     st0: usize,
     en0: usize,
@@ -124,11 +139,12 @@ fn fill_scores_fast_row_scalar(
     sc_n: i8,
     s: &mut [i8],
 ) {
-    for idx in st0..=en0 {
-        let sq = sf[idx];
-        let qidx = qrr_base + idx as i32;
-        // qpos >= 0 is guaranteed for idx in [st0, en0]; the cast is safe.
-        let qq = qr[qidx as usize];
+    let tlen_pad = s.len();
+    let end = (st0 + ((en0 - st0) / 16 + 1) * 16).min(tlen_pad);
+    for idx in st0..end {
+        let sq = sfqr[idx];
+        // qpos >= 0 is guaranteed for idx >= st0; the cast is safe.
+        let qq = sfqr[tlen_pad + (qrr_base + idx as i32) as usize];
         s[idx] = if sq == wildcard || qq == wildcard {
             sc_n
         } else if sq == qq {
@@ -139,73 +155,40 @@ fn fill_scores_fast_row_scalar(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn fill_scores_fast_row_avx2(
-    sf: &[u8],
-    qr: &[u8],
-    qrr_base: i32,
-    st0: usize,
-    en0: usize,
-    _tlen_pad: usize,
-    wildcard: u8,
-    sc_mch: i8,
-    sc_mis: i8,
-    sc_n: i8,
-    s: &mut [i8],
-) {
-    use std::arch::x86_64::*;
+// The SIMD fills work on the 16-cell blocks the DP kernels load rather than on
+// chunks from `st0`: a load of `s` then reads back exactly one store and is
+// forwarded from it. A load spanning two chunk stores has to wait for both to
+// leave the store buffer, which stalled every anti-diagonal. When `st0` is
+// not a multiple of 16, the first block starts before `st0` and the last one
+// ends after `st0 + 16k`; the cells outside keep their previous contents.
 
-    let wc = _mm256_set1_epi8(wildcard as i8);
-    let mch = _mm256_set1_epi8(sc_mch);
-    let mis = _mm256_set1_epi8(sc_mis);
-    let nsc = _mm256_set1_epi8(sc_n);
-
-    // The flat Workspace buffer guarantees sf is followed by at least 16 bytes
-    // of qr, and qr has a 16-byte trailing pad, so SIMD loads are always safe
-    // for t in [st0, en0].  qpos >= 0 is analytically guaranteed for valid t.
-    let mut t = st0;
-    while t + 32 <= en0 + 1 {
-        let qpos = (qrr_base + t as i32) as usize;
-        // SAFETY: flat buffer layout ensures sf[t..t+31] and qr[qpos..qpos+31] are in-bounds.
-        let sq = unsafe { _mm256_loadu_si256(sf.as_ptr().add(t) as *const __m256i) };
-        let qq = unsafe { _mm256_loadu_si256(qr.as_ptr().add(qpos) as *const __m256i) };
-        let mask_wc = _mm256_or_si256(_mm256_cmpeq_epi8(sq, wc), _mm256_cmpeq_epi8(qq, wc));
-        let eq = _mm256_cmpeq_epi8(sq, qq);
-        let mut tmp = _mm256_blendv_epi8(mis, mch, eq);
-        tmp = _mm256_blendv_epi8(tmp, nsc, mask_wc);
-        // SAFETY: s has tlen_pad bytes; t+31 <= en0+30 < tlen_pad+31, sf overshoot reads into qr pad.
-        unsafe { _mm256_storeu_si256(s.as_mut_ptr().add(t) as *mut __m256i, tmp) };
-        t += 32;
+/// `LOW_BYTES[16 - n..]` starts with `n` bytes set, for `n` in `0..=16`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+static LOW_BYTES: [i8; 32] = {
+    let mut m = [0i8; 32];
+    let mut i = 0;
+    while i < 16 {
+        m[i] = -1;
+        i += 1;
     }
-    // Handle the tail (0, 1, or 2 remaining 16-byte chunks) with SSE.
-    let sse_wc = _mm_set1_epi8(wildcard as i8);
-    let sse_mch = _mm_set1_epi8(sc_mch);
-    let sse_mis = _mm_set1_epi8(sc_mis);
-    let sse_nsc = _mm_set1_epi8(sc_n);
-    while t <= en0 {
-        let qpos = (qrr_base + t as i32) as usize;
-        // SAFETY: same flat-buffer guarantee, 16-byte load.
-        let sq = unsafe { _mm_loadu_si128(sf.as_ptr().add(t) as *const __m128i) };
-        let qq = unsafe { _mm_loadu_si128(qr.as_ptr().add(qpos) as *const __m128i) };
-        let mask_wc = _mm_or_si128(_mm_cmpeq_epi8(sq, sse_wc), _mm_cmpeq_epi8(qq, sse_wc));
-        let eq = _mm_cmpeq_epi8(sq, qq);
-        let mut tmp = _mm_blendv_epi8(sse_mis, sse_mch, eq);
-        tmp = _mm_blendv_epi8(tmp, sse_nsc, mask_wc);
-        unsafe { _mm_storeu_si128(s.as_mut_ptr().add(t) as *mut __m128i, tmp) };
-        t += 16;
-    }
-}
+    m
+};
 
+/// Scores of the 16 cells of the block at `t` (a multiple of 16). With
+/// `KEEP_LOW` the first `n` cells of the block keep their contents, without
+/// it the first `n` cells are the ones written (`n` in `0..=16`).
+///
+/// # Safety
+/// `t + 16 <= s.len()`, and `sfqr` holds 16 bytes at both `t` and
+/// `s.len() + qrr_base + t` (the latter may start up to 15 bytes before `qr`).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
-unsafe fn fill_scores_fast_row_sse41(
-    sf: &[u8],
-    qr: &[u8],
+#[inline]
+unsafe fn fill_scores_partial_block_sse41<const KEEP_LOW: bool>(
+    sfqr: &[u8],
     qrr_base: i32,
-    st0: usize,
-    en0: usize,
-    _tlen_pad: usize,
+    t: usize,
+    n: usize,
     wildcard: u8,
     sc_mch: i8,
     sc_mis: i8,
@@ -215,18 +198,181 @@ unsafe fn fill_scores_fast_row_sse41(
     use std::arch::x86_64::*;
 
     let wc = _mm_set1_epi8(wildcard as i8);
+    let qpos = (s.len() as isize + qrr_base as isize + t as isize) as usize;
+    debug_assert!(n <= 16 && t + 16 <= s.len() && qpos + 16 <= sfqr.len());
+    // SAFETY: both loads are inside `sfqr`, `sp` inside `s` (see above).
+    let sq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(t) as *const __m128i) };
+    let qq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(qpos) as *const __m128i) };
+    let sp = unsafe { s.as_mut_ptr().add(t) } as *mut __m128i;
+    let mask_wc = _mm_or_si128(_mm_cmpeq_epi8(sq, wc), _mm_cmpeq_epi8(qq, wc));
+    let eq = _mm_cmpeq_epi8(sq, qq);
+    let mut tmp = _mm_blendv_epi8(_mm_set1_epi8(sc_mis), _mm_set1_epi8(sc_mch), eq);
+    tmp = _mm_blendv_epi8(tmp, _mm_set1_epi8(sc_n), mask_wc);
+    // SAFETY: `16 - n..16 - n + 16` is inside the 32-byte table.
+    let low = unsafe { _mm_loadu_si128(LOW_BYTES.as_ptr().add(16 - n) as *const __m128i) };
+    // A volatile read, so that the compiler cannot fold load, blend and store
+    // into one masked store (it does with AVX-512): the DP kernel's load is
+    // not forwarded from a masked store.
+    let old = unsafe { sp.read_volatile() };
+    tmp = if KEEP_LOW {
+        _mm_blendv_epi8(tmp, old, low)
+    } else {
+        _mm_blendv_epi8(old, tmp, low)
+    };
+    unsafe { _mm_storeu_si128(sp, tmp) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn fill_scores_fast_row_avx2(
+    sfqr: &[u8],
+    qrr_base: i32,
+    st0: usize,
+    en0: usize,
+    wildcard: u8,
+    sc_mch: i8,
+    sc_mis: i8,
+    sc_n: i8,
+    s: &mut [i8],
+) {
+    use std::arch::x86_64::*;
+
+    let tlen_pad = s.len();
+    let end = st0 + ((en0 - st0) / 16 + 1) * 16;
+    let lim = end.min(tlen_pad);
+    // The last byte any block below reads from `qr` is at most cell
+    // `qrr_base + en0 + 30 <= qlen + 29`, inside the 32-byte pad; the first
+    // is at least 15 bytes before `qr`, inside `sf`.
+    assert!(
+        st0 <= en0
+            && en0 < tlen_pad
+            && qrr_base + st0 as i32 >= 0
+            && tlen_pad + (qrr_base + en0 as i32) as usize + 31 <= sfqr.len()
+    );
+
+    let mut t = st0 & !15;
+    if t < st0 {
+        // SAFETY: `t < st0 <= en0 < tlen_pad` and the bounds asserted above.
+        unsafe {
+            fill_scores_partial_block_sse41::<true>(
+                sfqr,
+                qrr_base,
+                t,
+                st0 - t,
+                wildcard,
+                sc_mch,
+                sc_mis,
+                sc_n,
+                s,
+            )
+        };
+        t += 16;
+    }
+    // Whole blocks, 32 cells at a time while they last: a 16-byte load is
+    // forwarded from a wider store too.
+    let wc = _mm256_set1_epi8(wildcard as i8);
+    let mch = _mm256_set1_epi8(sc_mch);
+    let mis = _mm256_set1_epi8(sc_mis);
+    let nsc = _mm256_set1_epi8(sc_n);
+    while t + 32 <= lim {
+        let qpos = (tlen_pad as isize + qrr_base as isize + t as isize) as usize;
+        // SAFETY: `st0 <= t` and `t + 32 <= lim`: all 32 cells are inside
+        // `[st0, end)` and `s`, and the loads inside `sfqr` (asserted above).
+        let sq = unsafe { _mm256_loadu_si256(sfqr.as_ptr().add(t) as *const __m256i) };
+        let qq = unsafe { _mm256_loadu_si256(sfqr.as_ptr().add(qpos) as *const __m256i) };
+        let mask_wc = _mm256_or_si256(_mm256_cmpeq_epi8(sq, wc), _mm256_cmpeq_epi8(qq, wc));
+        let eq = _mm256_cmpeq_epi8(sq, qq);
+        let mut tmp = _mm256_blendv_epi8(mis, mch, eq);
+        tmp = _mm256_blendv_epi8(tmp, nsc, mask_wc);
+        unsafe { _mm256_storeu_si256(s.as_mut_ptr().add(t) as *mut __m256i, tmp) };
+        t += 32;
+    }
+    if t + 16 <= lim {
+        let qpos = (tlen_pad as isize + qrr_base as isize + t as isize) as usize;
+        // SAFETY: as above, for 16 cells.
+        let sq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(t) as *const __m128i) };
+        let qq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(qpos) as *const __m128i) };
+        let (wc, eq) = (_mm256_castsi256_si128(wc), _mm_cmpeq_epi8(sq, qq));
+        let mask_wc = _mm_or_si128(_mm_cmpeq_epi8(sq, wc), _mm_cmpeq_epi8(qq, wc));
+        let mut tmp = _mm_blendv_epi8(_mm256_castsi256_si128(mis), _mm256_castsi256_si128(mch), eq);
+        tmp = _mm_blendv_epi8(tmp, _mm256_castsi256_si128(nsc), mask_wc);
+        unsafe { _mm_storeu_si128(s.as_mut_ptr().add(t) as *mut __m128i, tmp) };
+        t += 16;
+    }
+    if t < lim {
+        // SAFETY: `t` is a multiple of 16 below `lim <= tlen_pad`.
+        unsafe {
+            fill_scores_partial_block_sse41::<false>(
+                sfqr,
+                qrr_base,
+                t,
+                end - t,
+                wildcard,
+                sc_mch,
+                sc_mis,
+                sc_n,
+                s,
+            )
+        };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.1")]
+#[inline]
+unsafe fn fill_scores_fast_row_sse41(
+    sfqr: &[u8],
+    qrr_base: i32,
+    st0: usize,
+    en0: usize,
+    wildcard: u8,
+    sc_mch: i8,
+    sc_mis: i8,
+    sc_n: i8,
+    s: &mut [i8],
+) {
+    use std::arch::x86_64::*;
+
+    let tlen_pad = s.len();
+    let end = st0 + ((en0 - st0) / 16 + 1) * 16;
+    let lim = end.min(tlen_pad);
+    // see `fill_scores_fast_row_avx2`
+    assert!(
+        st0 <= en0
+            && en0 < tlen_pad
+            && qrr_base + st0 as i32 >= 0
+            && tlen_pad + (qrr_base + en0 as i32) as usize + 31 <= sfqr.len()
+    );
+
+    let mut t = st0 & !15;
+    if t < st0 {
+        // SAFETY: `t < st0 <= en0 < tlen_pad` and the bounds asserted above.
+        unsafe {
+            fill_scores_partial_block_sse41::<true>(
+                sfqr,
+                qrr_base,
+                t,
+                st0 - t,
+                wildcard,
+                sc_mch,
+                sc_mis,
+                sc_n,
+                s,
+            )
+        };
+        t += 16;
+    }
+    let wc = _mm_set1_epi8(wildcard as i8);
     let mch = _mm_set1_epi8(sc_mch);
     let mis = _mm_set1_epi8(sc_mis);
     let nsc = _mm_set1_epi8(sc_n);
-
-    // Flat buffer layout guarantees all 16-byte SIMD loads within [st0, en0]
-    // are in-bounds; qpos >= 0 is analytically guaranteed for valid t.
-    let mut t = st0;
-    while t <= en0 {
-        let qpos = (qrr_base + t as i32) as usize;
-        // SAFETY: flat buffer ensures sf[t..t+15] and qr[qpos..qpos+15] are in-bounds.
-        let sq = unsafe { _mm_loadu_si128(sf.as_ptr().add(t) as *const __m128i) };
-        let qq = unsafe { _mm_loadu_si128(qr.as_ptr().add(qpos) as *const __m128i) };
+    while t + 16 <= lim {
+        let qpos = (tlen_pad as isize + qrr_base as isize + t as isize) as usize;
+        // SAFETY: `st0 <= t` and `t + 16 <= lim`: all 16 cells are inside
+        // `[st0, end)` and `s`, and the loads inside `sfqr` (asserted above).
+        let sq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(t) as *const __m128i) };
+        let qq = unsafe { _mm_loadu_si128(sfqr.as_ptr().add(qpos) as *const __m128i) };
         let mask_wc = _mm_or_si128(_mm_cmpeq_epi8(sq, wc), _mm_cmpeq_epi8(qq, wc));
         let eq = _mm_cmpeq_epi8(sq, qq);
         let mut tmp = _mm_blendv_epi8(mis, mch, eq);
@@ -234,17 +380,37 @@ unsafe fn fill_scores_fast_row_sse41(
         unsafe { _mm_storeu_si128(s.as_mut_ptr().add(t) as *mut __m128i, tmp) };
         t += 16;
     }
+    if t < lim {
+        // SAFETY: `t` is a multiple of 16 below `lim <= tlen_pad`.
+        unsafe {
+            fill_scores_partial_block_sse41::<false>(
+                sfqr,
+                qrr_base,
+                t,
+                end - t,
+                wildcard,
+                sc_mch,
+                sc_mis,
+                sc_n,
+                s,
+            )
+        };
+    }
 }
 
+/// NEON counterpart of [`fill_scores_partial_block_sse41`].
+///
+/// # Safety
+/// `t + 16 <= s.len()`, and `sfqr` holds 16 bytes at both `t` and
+/// `s.len() + qrr_base + t` (the latter may start up to 15 bytes before `qr`).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn fill_scores_fast_row_neon(
-    sf: &[u8],
-    qr: &[u8],
+#[inline]
+unsafe fn fill_scores_partial_block_neon<const KEEP_LOW: bool>(
+    sfqr: &[u8],
     qrr_base: i32,
-    st0: usize,
-    en0: usize,
-    _tlen_pad: usize,
+    t: usize,
+    n: usize,
     wildcard: u8,
     sc_mch: i8,
     sc_mis: i8,
@@ -254,24 +420,104 @@ unsafe fn fill_scores_fast_row_neon(
     use std::arch::aarch64::*;
 
     let wc = vdupq_n_u8(wildcard);
+    let qpos = (s.len() as isize + qrr_base as isize + t as isize) as usize;
+    debug_assert!(n <= 16 && t + 16 <= s.len() && qpos + 16 <= sfqr.len());
+    // SAFETY: both loads are inside `sfqr`, `sp` inside `s` (see above).
+    let sq = unsafe { vld1q_u8(sfqr.as_ptr().add(t)) };
+    let qq = unsafe { vld1q_u8(sfqr.as_ptr().add(qpos)) };
+    let sp = unsafe { s.as_mut_ptr().add(t) };
+    let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
+    let eq = vceqq_u8(sq, qq);
+    let tmp = vbslq_s8(eq, vdupq_n_s8(sc_mch), vdupq_n_s8(sc_mis));
+    let tmp = vbslq_s8(mask_wc, vdupq_n_s8(sc_n), tmp);
+    // SAFETY: `16 - n..16 - n + 16` is inside the 32-byte table.
+    let low = unsafe { vld1q_u8(LOW_BYTES.as_ptr().add(16 - n) as *const u8) };
+    let old = unsafe { vld1q_s8(sp) };
+    let tmp = if KEEP_LOW {
+        vbslq_s8(low, old, tmp)
+    } else {
+        vbslq_s8(low, tmp, old)
+    };
+    unsafe { vst1q_s8(sp, tmp) };
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn fill_scores_fast_row_neon(
+    sfqr: &[u8],
+    qrr_base: i32,
+    st0: usize,
+    en0: usize,
+    wildcard: u8,
+    sc_mch: i8,
+    sc_mis: i8,
+    sc_n: i8,
+    s: &mut [i8],
+) {
+    use std::arch::aarch64::*;
+
+    let tlen_pad = s.len();
+    let end = st0 + ((en0 - st0) / 16 + 1) * 16;
+    let lim = end.min(tlen_pad);
+    // see `fill_scores_fast_row_avx2`
+    assert!(
+        st0 <= en0
+            && en0 < tlen_pad
+            && qrr_base + st0 as i32 >= 0
+            && tlen_pad + (qrr_base + en0 as i32) as usize + 31 <= sfqr.len()
+    );
+
+    let mut t = st0 & !15;
+    if t < st0 {
+        // SAFETY: `t < st0 <= en0 < tlen_pad` and the bounds asserted above.
+        unsafe {
+            fill_scores_partial_block_neon::<true>(
+                sfqr,
+                qrr_base,
+                t,
+                st0 - t,
+                wildcard,
+                sc_mch,
+                sc_mis,
+                sc_n,
+                s,
+            )
+        };
+        t += 16;
+    }
+    let wc = vdupq_n_u8(wildcard);
     let mch = vdupq_n_s8(sc_mch);
     let mis = vdupq_n_s8(sc_mis);
     let nsc = vdupq_n_s8(sc_n);
-
-    // Flat buffer layout guarantees all 16-byte SIMD loads within [st0, en0]
-    // are in-bounds; qpos >= 0 is analytically guaranteed for valid t.
-    let mut t = st0;
-    while t <= en0 {
-        let qpos = (qrr_base + t as i32) as usize;
-        // SAFETY: flat buffer ensures sf[t..t+15] and qr[qpos..qpos+15] are in-bounds.
-        let sq = unsafe { vld1q_u8(sf.as_ptr().add(t)) };
-        let qq = unsafe { vld1q_u8(qr.as_ptr().add(qpos)) };
+    while t + 16 <= lim {
+        let qpos = (tlen_pad as isize + qrr_base as isize + t as isize) as usize;
+        // SAFETY: `st0 <= t` and `t + 16 <= lim`: all 16 cells are inside
+        // `[st0, end)` and `s`, and the loads inside `sfqr` (asserted above).
+        let sq = unsafe { vld1q_u8(sfqr.as_ptr().add(t)) };
+        let qq = unsafe { vld1q_u8(sfqr.as_ptr().add(qpos)) };
         let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
         let eq = vceqq_u8(sq, qq);
         let tmp = vbslq_s8(eq, mch, mis);
         let tmp = vbslq_s8(mask_wc, nsc, tmp);
         unsafe { vst1q_s8(s.as_mut_ptr().add(t), tmp) };
         t += 16;
+    }
+    if t < lim {
+        // SAFETY: `t` is a multiple of 16 below `lim <= tlen_pad`.
+        unsafe {
+            fill_scores_partial_block_neon::<false>(
+                sfqr,
+                qrr_base,
+                t,
+                end - t,
+                wildcard,
+                sc_mch,
+                sc_mis,
+                sc_n,
+                s,
+            )
+        };
     }
 }
 
@@ -957,9 +1203,33 @@ fn update_h_exact_scalar(
     (max_h, max_t)
 }
 
+// Exact-max row update, `update_h_exact_scalar` without per-block branches:
+// the same `h` updates and the same `(max_h, max_t)`: the strictly greatest
+// interior score at its first position if it beats `h[en0]`, else `h[en0]` at
+// `en0`. The first per-backend versions reduced each block horizontally and
+// branched on the running maximum, a loop-carried scalar dependency that cost
+// about half the time of an exact score-only alignment. Here every lane keeps
+// its own maximum and the first position reaching it (strict `>`, so within a
+// lane the earliest position wins), with independent accumulators so no step
+// waits on the previous one, and the lanes are reduced once per row: the
+// maximum is the largest lane maximum, its first position the smallest
+// position among the lanes holding it.
+
+/// SSE4.1 lane-wise exact-max row update (also used by the AVX2 backend).
+///
+/// `h` is walked in absolute 4-cell groups (`g % 4 == 0`), whatever `st0` is:
+/// every anti-diagonal then loads and stores the same 16 bytes of `h`, and
+/// reads `v` inside one 16-byte store of the DP kernel, so each load is
+/// forwarded from a single store. (Groups anchored at `st0` move by one cell
+/// every other row, and their loads then straddle two stores of the previous
+/// row.) The groups holding `st0` and `en0` are masked; `h[en0]` is written
+/// with its group. Whole 16-cell blocks in between go four groups at a time
+/// into separate accumulators.
+///
+/// `h` must hold whole groups: `h.len() >= (en0 | 3) + 1`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
-unsafe fn update_h_exact_sse41(
+unsafe fn update_h_exact_lanes_sse41(
     h: &mut [i32],
     v: &[u8],
     u: &[u8],
@@ -967,122 +1237,154 @@ unsafe fn update_h_exact_sse41(
     en0: usize,
     qe: i32,
 ) -> (i32, i32) {
-    use ::core::ptr;
     use std::arch::x86_64::*;
 
-    if en0 > 0 {
-        h[en0] = h[en0 - 1] + i32::from(u[en0]) - qe;
+    let h_en = if en0 > 0 {
+        h[en0 - 1] + i32::from(u[en0]) - qe
     } else {
-        h[en0] = h[en0] + i32::from(v[en0]) - qe;
-    }
-    let mut max_h = h[en0];
-    let mut max_t = en0 as i32;
+        h[en0] + i32::from(v[en0]) - qe
+    };
+    let lo = st0 & !3;
+    let hi = en0 & !3;
+    assert!(st0 <= en0 && hi + 4 <= h.len() && hi + 4 <= v.len());
 
     let qe_v = _mm_set1_epi32(qe);
-    let mut t = st0;
-    while t + 4 <= en0 {
-        // SAFETY: bounds ensured by loop condition.
-        let hvec = unsafe { _mm_loadu_si128(h.as_ptr().add(t) as *const __m128i) };
-        // SAFETY: reading 4 bytes at `t` is in-bounds by loop condition.
-        let v4 = unsafe { ptr::read_unaligned(v.as_ptr().add(t) as *const u32) };
-        let vbytes = _mm_cvtsi32_si128(v4 as i32);
-        let v32 = _mm_cvtepu8_epi32(vbytes);
-        let updated = _mm_sub_epi32(_mm_add_epi32(hvec, v32), qe_v);
-        // SAFETY: bounds ensured by loop condition.
-        unsafe { _mm_storeu_si128(h.as_mut_ptr().add(t) as *mut __m128i, updated) };
-        let mx1 = _mm_max_epi32(updated, _mm_shuffle_epi32(updated, 0b10_11_00_01));
-        let mx2 = _mm_max_epi32(mx1, _mm_shuffle_epi32(mx1, 0b01_00_11_10));
-        let block_max = _mm_cvtsi128_si32(mx2);
-        if block_max > max_h {
-            max_h = block_max;
-            let mut vals = [0i32; 4];
-            // SAFETY: local fixed-size buffer.
-            unsafe { _mm_storeu_si128(vals.as_mut_ptr() as *mut __m128i, updated) };
-            for (i, &val) in vals.iter().enumerate() {
-                if val == block_max {
-                    max_t = (t + i) as i32;
-                    break;
-                }
+    let lane = _mm_setr_epi32(0, 1, 2, 3);
+    let st_m1 = _mm_set1_epi32(st0 as i32 - 1);
+    let en_v = _mm_set1_epi32(en0 as i32);
+    let hen_v = _mm_set1_epi32(h_en);
+    let min_v = _mm_set1_epi32(i32::MIN);
+    let mut mx = [min_v; 4];
+    let mut mt = [_mm_set1_epi32(i32::MAX); 4];
+
+    // The group at `g` when it holds `st0` or `en0`: the cells in
+    // `[st0, en0)` are updated and enter accumulator 0, `h[en0]` is set, the
+    // others are stored back as they were.
+    macro_rules! masked_group {
+        ($g:expr) => {{
+            let g: usize = $g;
+            // SAFETY: `g <= hi`, so the group is inside `h` and `v` (asserted).
+            let hp = unsafe { h.as_mut_ptr().add(g) } as *mut __m128i;
+            // volatile: keeps the store below a plain one, see
+            // `fill_scores_partial_block_sse41`
+            let hv = unsafe { hp.read_volatile() };
+            let v4 = unsafe { (v.as_ptr().add(g) as *const i32).read_unaligned() };
+            let vw = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(v4));
+            let nh = _mm_sub_epi32(_mm_add_epi32(hv, vw), qe_v);
+            let pos = _mm_add_epi32(_mm_set1_epi32(g as i32), lane);
+            let inside = _mm_and_si128(_mm_cmpgt_epi32(pos, st_m1), _mm_cmpgt_epi32(en_v, pos));
+            let mut out = _mm_blendv_epi8(hv, nh, inside);
+            out = _mm_blendv_epi8(out, hen_v, _mm_cmpeq_epi32(pos, en_v));
+            unsafe { _mm_storeu_si128(hp, out) };
+            let take = _mm_and_si128(inside, _mm_cmpgt_epi32(nh, mx[0]));
+            mx[0] = _mm_blendv_epi8(mx[0], nh, take);
+            mt[0] = _mm_blendv_epi8(mt[0], pos, take);
+        }};
+    }
+    // A group wholly inside `[st0, en0)`, into accumulator 0.
+    macro_rules! whole_group {
+        ($g:expr) => {{
+            let g: usize = $g;
+            // SAFETY: `g + 4 <= en0`, within both `h` and `v` (asserted above).
+            let hp = unsafe { h.as_mut_ptr().add(g) } as *mut __m128i;
+            let v4 = unsafe { (v.as_ptr().add(g) as *const i32).read_unaligned() };
+            let vw = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(v4));
+            let nh = _mm_sub_epi32(_mm_add_epi32(unsafe { _mm_loadu_si128(hp) }, vw), qe_v);
+            unsafe { _mm_storeu_si128(hp, nh) };
+            let take = _mm_cmpgt_epi32(nh, mx[0]);
+            mx[0] = _mm_blendv_epi8(mx[0], nh, take);
+            mt[0] = _mm_blendv_epi8(mt[0], _mm_add_epi32(_mm_set1_epi32(g as i32), lane), take);
+        }};
+    }
+
+    let mut g = lo;
+    if g < st0 {
+        masked_group!(g);
+        g += 4;
+    }
+    // Whole groups up to the first whole 16-cell block...
+    while g + 4 <= en0 && (g & 15 != 0 || g + 16 > en0) {
+        whole_group!(g);
+        g += 4;
+    }
+    // ...the whole blocks, four groups at a time...
+    let wide = g + 16 <= en0;
+    if wide {
+        let base = _mm_add_epi32(_mm_set1_epi32(g as i32), lane);
+        let mut idx = [
+            base,
+            _mm_add_epi32(base, _mm_set1_epi32(4)),
+            _mm_add_epi32(base, _mm_set1_epi32(8)),
+            _mm_add_epi32(base, _mm_set1_epi32(12)),
+        ];
+        let sixteen = _mm_set1_epi32(16);
+        while g + 16 <= en0 {
+            // SAFETY: `g + 16 <= en0`, within both `h` and `v` (asserted above).
+            let vb = unsafe { _mm_loadu_si128(v.as_ptr().add(g) as *const __m128i) };
+            let vw = [
+                _mm_cvtepu8_epi32(vb),
+                _mm_cvtepu8_epi32(_mm_srli_si128(vb, 4)),
+                _mm_cvtepu8_epi32(_mm_srli_si128(vb, 8)),
+                _mm_cvtepu8_epi32(_mm_srli_si128(vb, 12)),
+            ];
+            for k in 0..4 {
+                let hp = unsafe { h.as_mut_ptr().add(g + 4 * k) } as *mut __m128i;
+                let nh = _mm_sub_epi32(_mm_add_epi32(unsafe { _mm_loadu_si128(hp) }, vw[k]), qe_v);
+                unsafe { _mm_storeu_si128(hp, nh) };
+                let take = _mm_cmpgt_epi32(nh, mx[k]);
+                mx[k] = _mm_blendv_epi8(mx[k], nh, take);
+                mt[k] = _mm_blendv_epi8(mt[k], idx[k], take);
+                idx[k] = _mm_add_epi32(idx[k], sixteen);
             }
+            g += 16;
         }
-        t += 4;
-    }
-    for idx in t..en0 {
-        h[idx] += i32::from(v[idx]) - qe;
-        if h[idx] > max_h {
-            max_h = h[idx];
-            max_t = idx as i32;
+        // ...and the whole groups after them. Accumulator 0 still sees its
+        // positions in increasing order, so it still keeps the first maximum.
+        while g + 4 <= en0 {
+            whole_group!(g);
+            g += 4;
         }
     }
-    (max_h, max_t)
-}
+    // The group of `en0`, unless it was also the group of `st0`.
+    if g <= hi {
+        masked_group!(g);
+    }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn update_h_exact_avx2(
-    h: &mut [i32],
-    v: &[u8],
-    u: &[u8],
-    st0: usize,
-    en0: usize,
-    qe: i32,
-) -> (i32, i32) {
-    use ::core::ptr;
-    use std::arch::x86_64::*;
-
-    if en0 > 0 {
-        h[en0] = h[en0 - 1] + i32::from(u[en0]) - qe;
+    let none = _mm_set1_epi32(i32::MAX);
+    let (mut m4, mut first);
+    if wide {
+        let mall = _mm_max_epi32(_mm_max_epi32(mx[0], mx[1]), _mm_max_epi32(mx[2], mx[3]));
+        m4 = _mm_max_epi32(mall, _mm_shuffle_epi32(mall, 0b01_00_11_10));
+        m4 = _mm_max_epi32(m4, _mm_shuffle_epi32(m4, 0b10_11_00_01));
+        first = none;
+        for k in 0..4 {
+            first = _mm_min_epi32(
+                first,
+                _mm_blendv_epi8(none, mt[k], _mm_cmpeq_epi32(mx[k], m4)),
+            );
+        }
     } else {
-        h[en0] = h[en0] + i32::from(v[en0]) - qe;
+        m4 = _mm_max_epi32(mx[0], _mm_shuffle_epi32(mx[0], 0b01_00_11_10));
+        m4 = _mm_max_epi32(m4, _mm_shuffle_epi32(m4, 0b10_11_00_01));
+        first = _mm_blendv_epi8(none, mt[0], _mm_cmpeq_epi32(mx[0], m4));
     }
-    let mut max_h = h[en0];
-    let mut max_t = en0 as i32;
-
-    let qe_v = _mm256_set1_epi32(qe);
-    let mut t = st0;
-    while t + 8 <= en0 {
-        // SAFETY: bounds ensured by loop condition.
-        let hvec = unsafe { _mm256_loadu_si256(h.as_ptr().add(t) as *const __m256i) };
-        // SAFETY: reading 8 bytes at `t` is in-bounds by loop condition.
-        let v8 = unsafe { ptr::read_unaligned(v.as_ptr().add(t) as *const u64) };
-        let vbytes = _mm_cvtsi64_si128(v8 as i64);
-        let v32 = _mm256_cvtepu8_epi32(vbytes);
-        let updated = _mm256_sub_epi32(_mm256_add_epi32(hvec, v32), qe_v);
-        // SAFETY: bounds ensured by loop condition.
-        unsafe { _mm256_storeu_si256(h.as_mut_ptr().add(t) as *mut __m256i, updated) };
-        let hi = _mm256_extracti128_si256(updated, 1);
-        let lo = _mm256_castsi256_si128(updated);
-        let fold = _mm_max_epi32(lo, hi);
-        let mx1 = _mm_max_epi32(fold, _mm_shuffle_epi32(fold, 0b10_11_00_01));
-        let mx2 = _mm_max_epi32(mx1, _mm_shuffle_epi32(mx1, 0b01_00_11_10));
-        let block_max = _mm_cvtsi128_si32(mx2);
-        if block_max > max_h {
-            max_h = block_max;
-            let mut vals = [0i32; 8];
-            // SAFETY: local fixed-size buffer.
-            unsafe { _mm256_storeu_si256(vals.as_mut_ptr() as *mut __m256i, updated) };
-            for (i, &val) in vals.iter().enumerate() {
-                if val == block_max {
-                    max_t = (t + i) as i32;
-                    break;
-                }
-            }
-        }
-        t += 8;
+    first = _mm_min_epi32(first, _mm_shuffle_epi32(first, 0b01_00_11_10));
+    first = _mm_min_epi32(first, _mm_shuffle_epi32(first, 0b10_11_00_01));
+    let best = _mm_cvtsi128_si32(m4);
+    if best > h_en {
+        (best, _mm_cvtsi128_si32(first))
+    } else {
+        (h_en, en0 as i32)
     }
-    for idx in t..en0 {
-        h[idx] += i32::from(v[idx]) - qe;
-        if h[idx] > max_h {
-            max_h = h[idx];
-            max_t = idx as i32;
-        }
-    }
-    (max_h, max_t)
 }
 
+/// NEON lane-wise exact-max row update: [`update_h_exact_lanes_sse41`], group
+/// for group.
+///
+/// `h` must hold whole groups: `h.len() >= (en0 | 3) + 1`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn update_h_exact_neon(
+unsafe fn update_h_exact_lanes_neon(
     h: &mut [i32],
     v: &[u8],
     u: &[u8],
@@ -1092,122 +1394,142 @@ unsafe fn update_h_exact_neon(
 ) -> (i32, i32) {
     use std::arch::aarch64::*;
 
-    if en0 > 0 {
-        h[en0] = h[en0 - 1] + i32::from(u[en0]) - qe;
+    let h_en = if en0 > 0 {
+        h[en0 - 1] + i32::from(u[en0]) - qe
     } else {
-        h[en0] = h[en0] + i32::from(v[en0]) - qe;
-    }
-    let mut max_h = h[en0];
-    let mut max_t = en0 as i32;
+        h[en0] + i32::from(v[en0]) - qe
+    };
+    let lo = st0 & !3;
+    let hi = en0 & !3;
+    assert!(st0 <= en0 && hi + 4 <= h.len() && hi + 4 <= v.len());
 
     let qe_v = vdupq_n_s32(qe);
-    let mut t = st0;
-    while t + 8 <= en0 {
-        // SAFETY: bounds ensured by loop condition.
-        let v8 = unsafe { vld1_u8(v.as_ptr().add(t)) };
-        let v16 = vmovl_u8(v8);
-        let v32_lo = vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(v16)));
-        let v32_hi = vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(v16)));
+    let lane = unsafe { vld1q_s32([0i32, 1, 2, 3].as_ptr()) };
+    let st_m1 = vdupq_n_s32(st0 as i32 - 1);
+    let en_v = vdupq_n_s32(en0 as i32);
+    let hen_v = vdupq_n_s32(h_en);
+    let mut mx = [vdupq_n_s32(i32::MIN); 4];
+    let mut mt = [vdupq_n_s32(i32::MAX); 4];
 
-        // SAFETY: bounds ensured by loop condition.
-        let h_lo = unsafe { vld1q_s32(h.as_ptr().add(t)) };
-        // SAFETY: bounds ensured by loop condition.
-        let h_hi = unsafe { vld1q_s32(h.as_ptr().add(t + 4)) };
-        let out_lo = vsubq_s32(vaddq_s32(h_lo, v32_lo), qe_v);
-        let out_hi = vsubq_s32(vaddq_s32(h_hi, v32_hi), qe_v);
-        // SAFETY: bounds ensured by loop condition.
-        unsafe { vst1q_s32(h.as_mut_ptr().add(t), out_lo) };
-        // SAFETY: bounds ensured by loop condition.
-        unsafe { vst1q_s32(h.as_mut_ptr().add(t + 4), out_hi) };
-        let block_max = vmaxvq_s32(vmaxq_s32(out_lo, out_hi));
-        if block_max > max_h {
-            // Avoid spilling vectors to memory: probe lanes directly.
-            max_h = block_max;
-            if vgetq_lane_s32(out_lo, 0) == block_max {
-                max_t = t as i32;
-            } else if vgetq_lane_s32(out_lo, 1) == block_max {
-                max_t = (t + 1) as i32;
-            } else if vgetq_lane_s32(out_lo, 2) == block_max {
-                max_t = (t + 2) as i32;
-            } else if vgetq_lane_s32(out_lo, 3) == block_max {
-                max_t = (t + 3) as i32;
-            } else if vgetq_lane_s32(out_hi, 0) == block_max {
-                max_t = (t + 4) as i32;
-            } else if vgetq_lane_s32(out_hi, 1) == block_max {
-                max_t = (t + 5) as i32;
-            } else if vgetq_lane_s32(out_hi, 2) == block_max {
-                max_t = (t + 6) as i32;
-            } else {
-                max_t = (t + 7) as i32;
-            }
-        }
-        t += 8;
+    // The four cells of `v` at `g`, widened.
+    macro_rules! v_group {
+        ($g:expr) => {{
+            // SAFETY: the group is inside `v` (asserted above).
+            let v4 = unsafe { (v.as_ptr().add($g) as *const u32).read_unaligned() };
+            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(
+                vdup_n_u32(v4),
+            )))))
+        }};
     }
-    for idx in t..en0 {
-        h[idx] += i32::from(v[idx]) - qe;
-        if h[idx] > max_h {
-            max_h = h[idx];
-            max_t = idx as i32;
-        }
+    // The group at `g` when it holds `st0` or `en0`: the cells in
+    // `[st0, en0)` are updated and enter accumulator 0, `h[en0]` is set, the
+    // others are stored back as they were.
+    macro_rules! masked_group {
+        ($g:expr) => {{
+            let g: usize = $g;
+            // SAFETY: `g <= hi`, so the group is inside `h` and `v` (asserted).
+            let hp = unsafe { h.as_mut_ptr().add(g) };
+            let hv = unsafe { vld1q_s32(hp) };
+            let nh = vsubq_s32(vaddq_s32(hv, v_group!(g)), qe_v);
+            let pos = vaddq_s32(vdupq_n_s32(g as i32), lane);
+            let inside = vandq_u32(vcgtq_s32(pos, st_m1), vcgtq_s32(en_v, pos));
+            let out = vbslq_s32(inside, nh, hv);
+            let out = vbslq_s32(vceqq_s32(pos, en_v), hen_v, out);
+            unsafe { vst1q_s32(hp, out) };
+            let take = vandq_u32(inside, vcgtq_s32(nh, mx[0]));
+            mx[0] = vbslq_s32(take, nh, mx[0]);
+            mt[0] = vbslq_s32(take, pos, mt[0]);
+        }};
     }
-    (max_h, max_t)
-}
+    // A group wholly inside `[st0, en0)`, into accumulator 0.
+    macro_rules! whole_group {
+        ($g:expr) => {{
+            let g: usize = $g;
+            // SAFETY: `g + 4 <= en0`, within both `h` and `v` (asserted above).
+            let hp = unsafe { h.as_mut_ptr().add(g) };
+            let nh = vsubq_s32(vaddq_s32(unsafe { vld1q_s32(hp) }, v_group!(g)), qe_v);
+            unsafe { vst1q_s32(hp, nh) };
+            let take = vcgtq_s32(nh, mx[0]);
+            mx[0] = vbslq_s32(take, nh, mx[0]);
+            mt[0] = vbslq_s32(take, vaddq_s32(vdupq_n_s32(g as i32), lane), mt[0]);
+        }};
+    }
 
-#[inline(always)]
-#[allow(dead_code)]
-unsafe fn fill_fast_row_dispatch(
-    backend: SimdBackend,
-    sf: &[u8],
-    qr: &[u8],
-    qrr_base: i32,
-    st0: usize,
-    en0: usize,
-    wildcard: u8,
-    sc_mch: i8,
-    sc_mis: i8,
-    sc_n: i8,
-    s: &mut [i8],
-) {
-    match backend {
-        SimdBackend::Scalar => fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-        ),
-        SimdBackend::Avx2 => {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                fill_scores_fast_row_avx2(
-                    sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
-                )
+    let mut g = lo;
+    if g < st0 {
+        masked_group!(g);
+        g += 4;
+    }
+    // Whole groups up to the first whole 16-cell block...
+    while g + 4 <= en0 && (g & 15 != 0 || g + 16 > en0) {
+        whole_group!(g);
+        g += 4;
+    }
+    // ...the whole blocks, four groups at a time...
+    let wide = g + 16 <= en0;
+    if wide {
+        let base = vaddq_s32(vdupq_n_s32(g as i32), lane);
+        let mut idx = [
+            base,
+            vaddq_s32(base, vdupq_n_s32(4)),
+            vaddq_s32(base, vdupq_n_s32(8)),
+            vaddq_s32(base, vdupq_n_s32(12)),
+        ];
+        let sixteen = vdupq_n_s32(16);
+        while g + 16 <= en0 {
+            // SAFETY: `g + 16 <= en0`, within both `h` and `v` (asserted above).
+            let vb = unsafe { vld1q_u8(v.as_ptr().add(g)) };
+            let (w_lo, w_hi) = (vmovl_u8(vget_low_u8(vb)), vmovl_high_u8(vb));
+            let vw = [
+                vmovl_u16(vget_low_u16(w_lo)),
+                vmovl_high_u16(w_lo),
+                vmovl_u16(vget_low_u16(w_hi)),
+                vmovl_high_u16(w_hi),
+            ];
+            for k in 0..4 {
+                let hp = unsafe { h.as_mut_ptr().add(g + 4 * k) };
+                let nh = vsubq_s32(
+                    vaddq_s32(unsafe { vld1q_s32(hp) }, vreinterpretq_s32_u32(vw[k])),
+                    qe_v,
+                );
+                unsafe { vst1q_s32(hp, nh) };
+                let take = vcgtq_s32(nh, mx[k]);
+                mx[k] = vbslq_s32(take, nh, mx[k]);
+                mt[k] = vbslq_s32(take, idx[k], mt[k]);
+                idx[k] = vaddq_s32(idx[k], sixteen);
             }
-            #[cfg(not(target_arch = "x86_64"))]
-            fill_scores_fast_row_scalar(
-                sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-            )
+            g += 16;
         }
-        SimdBackend::Sse41 => {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                fill_scores_fast_row_sse41(
-                    sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
-                )
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            fill_scores_fast_row_scalar(
-                sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-            )
+        // ...and the whole groups after them. Accumulator 0 still sees its
+        // positions in increasing order, so it still keeps the first maximum.
+        while g + 4 <= en0 {
+            whole_group!(g);
+            g += 4;
         }
-        SimdBackend::Neon => {
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                fill_scores_fast_row_neon(
-                    sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
-                )
-            }
-            #[cfg(not(target_arch = "aarch64"))]
-            fill_scores_fast_row_scalar(
-                sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-            )
+    }
+    // The group of `en0`, unless it was also the group of `st0`.
+    if g <= hi {
+        masked_group!(g);
+    }
+
+    let none = vdupq_n_s32(i32::MAX);
+    let (best, first);
+    if wide {
+        best = vmaxvq_s32(vmaxq_s32(vmaxq_s32(mx[0], mx[1]), vmaxq_s32(mx[2], mx[3])));
+        let mv = vdupq_n_s32(best);
+        let mut f = none;
+        for k in 0..4 {
+            f = vminq_s32(f, vbslq_s32(vceqq_s32(mx[k], mv), mt[k], none));
         }
+        first = f;
+    } else {
+        best = vmaxvq_s32(mx[0]);
+        first = vbslq_s32(vceqq_s32(mx[0], vdupq_n_s32(best)), mt[0], none);
+    }
+    if best > h_en {
+        (best, vminvq_s32(first))
+    } else {
+        (h_en, en0 as i32)
     }
 }
 
@@ -1361,8 +1683,7 @@ unsafe fn dp_row_score_only_dispatch(
 
 pub(super) trait BackendOps {
     unsafe fn fill_fast_row(
-        sf: &[u8],
-        qr: &[u8],
+        sfqr: &[u8],
         qrr_base: i32,
         st0: usize,
         en0: usize,
@@ -1411,11 +1732,13 @@ pub(super) trait BackendOps {
     ) -> (i32, i32);
 }
 
-/// Carve the flat `Workspace::buf` into the seven named DP slices.
+/// Carve the flat `Workspace::buf` into the named DP slices.
 ///
-/// Layout: `[u | v | x | y | s | sf | qr+16]`, matching the C reference.
+/// Layout: `[u | v | x | y | s | sf | qr+32]`, matching the C reference.
 /// The `s` slice is re-interpreted as `&mut [i8]` (same size/alignment as
 /// `u8`).  All returned slices are non-overlapping sub-slices of `buf`.
+/// `sf` and `qr` come back as one slice, `sfqr`: the score fill reads across
+/// their boundary (`sf` is `tlen_pad` long).
 #[inline]
 pub(super) fn split_main_buf(
     buf: &mut [u8],
@@ -1428,18 +1751,16 @@ pub(super) fn split_main_buf(
     &mut [u8],
     &mut [i8],
     &mut [u8],
-    &mut [u8],
 ) {
     let (u, rest) = buf.split_at_mut(tlen_pad);
     let (v, rest) = rest.split_at_mut(tlen_pad);
     let (x, rest) = rest.split_at_mut(tlen_pad);
     let (y, rest) = rest.split_at_mut(tlen_pad);
     let (s_raw, rest) = rest.split_at_mut(tlen_pad);
-    let (sf, rest) = rest.split_at_mut(tlen_pad);
-    let (qr, _) = rest.split_at_mut(qlen_pad + 16);
+    let (sfqr, _) = rest.split_at_mut(tlen_pad + qlen_pad + 32);
     // SAFETY: i8 has the same size and alignment as u8; the slice is valid.
     let s = unsafe { std::slice::from_raw_parts_mut(s_raw.as_mut_ptr() as *mut i8, tlen_pad) };
-    (u, v, x, y, s, sf, qr)
+    (u, v, x, y, s, sfqr)
 }
 
 pub(super) struct ScalarOps;
@@ -1453,8 +1774,7 @@ pub(super) struct NeonOps;
 impl BackendOps for ScalarOps {
     #[inline(always)]
     unsafe fn fill_fast_row(
-        sf: &[u8],
-        qr: &[u8],
+        sfqr: &[u8],
         qrr_base: i32,
         st0: usize,
         en0: usize,
@@ -1464,9 +1784,7 @@ impl BackendOps for ScalarOps {
         sc_n: i8,
         s: &mut [i8],
     ) {
-        fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-        );
+        fill_scores_fast_row_scalar(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
     }
 
     #[inline(always)]
@@ -1584,8 +1902,7 @@ impl BackendOps for ScalarOps {
 impl BackendOps for Sse41Ops {
     #[inline(always)]
     unsafe fn fill_fast_row(
-        sf: &[u8],
-        qr: &[u8],
+        sfqr: &[u8],
         qrr_base: i32,
         st0: usize,
         en0: usize,
@@ -1597,14 +1914,10 @@ impl BackendOps for Sse41Ops {
     ) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            fill_scores_fast_row_sse41(
-                sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
-            );
+            fill_scores_fast_row_sse41(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
         }
         #[cfg(not(target_arch = "x86_64"))]
-        fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-        );
+        fill_scores_fast_row_scalar(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
     }
 
     #[inline(always)]
@@ -1740,7 +2053,7 @@ impl BackendOps for Sse41Ops {
     ) -> (i32, i32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            update_h_exact_sse41(h, v, u, st0, en0, qe)
+            update_h_exact_lanes_sse41(h, v, u, st0, en0, qe)
         }
         #[cfg(not(target_arch = "x86_64"))]
         update_h_exact_scalar(h, v, u, st0, en0, qe)
@@ -1750,8 +2063,7 @@ impl BackendOps for Sse41Ops {
 impl BackendOps for Avx2Ops {
     #[inline(always)]
     unsafe fn fill_fast_row(
-        sf: &[u8],
-        qr: &[u8],
+        sfqr: &[u8],
         qrr_base: i32,
         st0: usize,
         en0: usize,
@@ -1763,14 +2075,10 @@ impl BackendOps for Avx2Ops {
     ) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            fill_scores_fast_row_avx2(
-                sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
-            );
+            fill_scores_fast_row_avx2(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
         }
         #[cfg(not(target_arch = "x86_64"))]
-        fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-        );
+        fill_scores_fast_row_scalar(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
     }
 
     #[inline(always)]
@@ -1852,7 +2160,7 @@ impl BackendOps for Avx2Ops {
     ) -> (i32, i32) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            update_h_exact_avx2(h, v, u, st0, en0, qe)
+            update_h_exact_lanes_sse41(h, v, u, st0, en0, qe)
         }
         #[cfg(not(target_arch = "x86_64"))]
         update_h_exact_scalar(h, v, u, st0, en0, qe)
@@ -1862,8 +2170,7 @@ impl BackendOps for Avx2Ops {
 impl BackendOps for NeonOps {
     #[inline(always)]
     unsafe fn fill_fast_row(
-        sf: &[u8],
-        qr: &[u8],
+        sfqr: &[u8],
         qrr_base: i32,
         st0: usize,
         en0: usize,
@@ -1875,14 +2182,10 @@ impl BackendOps for NeonOps {
     ) {
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            fill_scores_fast_row_neon(
-                sf, qr, qrr_base, st0, en0, 0, wildcard, sc_mch, sc_mis, sc_n, s,
-            );
+            fill_scores_fast_row_neon(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
         }
         #[cfg(not(target_arch = "aarch64"))]
-        fill_scores_fast_row_scalar(
-            sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-        );
+        fill_scores_fast_row_scalar(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
     }
 
     #[inline(always)]
@@ -2005,13 +2308,19 @@ impl BackendOps for NeonOps {
     ) -> (i32, i32) {
         #[cfg(target_arch = "aarch64")]
         unsafe {
-            update_h_exact_neon(h, v, u, st0, en0, qe)
+            update_h_exact_lanes_neon(h, v, u, st0, en0, qe)
         }
         #[cfg(not(target_arch = "aarch64"))]
         update_h_exact_scalar(h, v, u, st0, en0, qe)
     }
 }
 
+// The core is generic over the backend and carries no target feature itself:
+// it has to be inlined into the `#[target_feature]` entry points in `mod.rs`,
+// or the kernels (which do carry one) cannot be inlined into it and every
+// anti-diagonal pays three calls, with the glue compiled for the baseline.
+
+#[inline(always)]
 fn extz2_core_score_only<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
     if (input.flag & KSW_EZ_APPROX_MAX) != 0 {
         if (input.flag & KSW_EZ_RIGHT) != 0 {
@@ -2028,6 +2337,7 @@ fn extz2_core_score_only<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, w
     }
 }
 
+#[inline(always)]
 fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bool>(
     input: &Extz2Input<'_>,
     ez: &mut Extz,
@@ -2049,8 +2359,10 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
     let no_max = (input.flag & super::KSW_EZ_NO_MAX) != 0 && input.zdrop < 0;
     let qe2 = qe * 2;
 
+    // A band at least as wide as the longer sequence never binds; clamping
+    // it also keeps `r + w` from overflowing.
     let mut w = input.w;
-    if w < 0 {
+    if w < 0 || w as usize > qlen.max(tlen) {
         w = qlen.max(tlen) as i32;
     }
     let (wl, wr) = (w, w);
@@ -2062,7 +2374,8 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
         max_sc = max(max_sc, xi);
         min_sc = min(min_sc, xi);
     }
-    if -min_sc > 2 * qe {
+    // outside the 8-bit cell range, see `Extz2Input`
+    if -min_sc > 2 * qe || max_sc + 2 * qe > 255 {
         return;
     }
 
@@ -2071,13 +2384,12 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
     let tlen_pad = ws.tlen_pad;
     let qlen_pad = ws.qlen_pad;
     let h = &mut ws.h;
-    let (u, v, x, y, s, sf, qr) = split_main_buf(&mut ws.buf, tlen_pad, qlen_pad);
+    let (u, v, x, y, s, sfqr) = split_main_buf(&mut ws.buf, tlen_pad, qlen_pad);
 
-    sf[..tlen].copy_from_slice(input.target);
+    sfqr[..tlen].copy_from_slice(input.target);
     for (i, qv) in input.query.iter().enumerate() {
-        qr[qlen - 1 - i] = *qv;
+        sfqr[tlen_pad + qlen - 1 - i] = *qv;
     }
-    debug_assert_eq!(qr.len(), qlen_pad + 16);
 
     let sc_mch = input.mat[0];
     let sc_mis = input.mat[1];
@@ -2137,16 +2449,15 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
         if !generic_sc {
             // SAFETY: selected once from runtime-dispatched backend.
             unsafe {
-                B::fill_fast_row(
-                    sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-                );
+                B::fill_fast_row(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
             }
         } else {
-            s[stv as usize..=env as usize].fill(0);
+            // Only `[st0, en0]`, as in C: the padding keeps what earlier
+            // anti-diagonals left there.
             for t in st0..=en0 {
-                let sq = sf[t] as usize;
+                let sq = sfqr[t] as usize;
                 let qidx = (qrr_base + t as i32) as usize;
-                let qq = qr[qidx] as usize;
+                let qq = sfqr[tlen_pad + qidx] as usize;
                 s[t] = input.mat[sq * m as usize + qq];
             }
         }
@@ -2261,6 +2572,7 @@ fn extz2_core_score_only_impl<B: BackendOps, const APPROX: bool, const RIGHT: bo
     }
 }
 
+#[inline(always)]
 fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: bool>(
     input: &Extz2Input<'_>,
     ez: &mut Extz,
@@ -2284,8 +2596,10 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
     let no_max = false;
     let qe2 = qe * 2;
 
+    // A band at least as wide as the longer sequence never binds; clamping
+    // it also keeps `r + w` from overflowing.
     let mut w = input.w;
-    if w < 0 {
+    if w < 0 || w as usize > qlen.max(tlen) {
         w = qlen.max(tlen) as i32;
     }
     let (wl, wr) = (w, w);
@@ -2297,16 +2611,20 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
         max_sc = max(max_sc, xi);
         min_sc = min(min_sc, xi);
     }
-    if -min_sc > 2 * qe {
+    // outside the 8-bit cell range, see `Extz2Input`
+    if -min_sc > 2 * qe || max_sc + 2 * qe > 255 {
         return;
     }
 
     let generic_sc = (input.flag & KSW_EZ_GENERIC_SC) != 0;
 
     let rows = qlen + tlen - 1;
-    let mut n_col = qlen.min(tlen);
-    n_col = n_col.min((w + 1) as usize);
-    let n_col = n_col + 16;
+    // Row stride of the traceback matrix, in whole 16-cell blocks as in C: a
+    // row of `n` cells spans at most `ceil(n / 16) + 1` blocks. A narrower
+    // stride lets the padding of one row run into the next, and the
+    // backtrack reads that padding at a band edge.
+    let n_col = qlen.min(tlen).min(w as usize + 1);
+    let n_col = (n_col.div_ceil(16) + 1) * 16;
     ws.prepare_traceback(qlen, tlen, APPROX, rows, n_col);
     let tlen_pad = ws.tlen_pad;
     let qlen_pad = ws.qlen_pad;
@@ -2314,13 +2632,12 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
     let off = &mut ws.off;
     let off_end = &mut ws.off_end;
     let p = &mut ws.p;
-    let (u, v, x, y, s, sf, qr) = split_main_buf(&mut ws.buf, tlen_pad, qlen_pad);
+    let (u, v, x, y, s, sfqr) = split_main_buf(&mut ws.buf, tlen_pad, qlen_pad);
 
-    sf[..tlen].copy_from_slice(input.target);
+    sfqr[..tlen].copy_from_slice(input.target);
     for (i, qv) in input.query.iter().enumerate() {
-        qr[qlen - 1 - i] = *qv;
+        sfqr[tlen_pad + qlen - 1 - i] = *qv;
     }
-    debug_assert_eq!(qr.len(), qlen_pad + 16);
 
     let sc_mch = input.mat[0];
     let sc_mis = input.mat[1];
@@ -2383,16 +2700,15 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
         if !generic_sc {
             // SAFETY: selected once from runtime-dispatched backend.
             unsafe {
-                B::fill_fast_row(
-                    sf, qr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s,
-                );
+                B::fill_fast_row(sfqr, qrr_base, st0, en0, wildcard, sc_mch, sc_mis, sc_n, s);
             }
         } else {
-            s[stv as usize..=env as usize].fill(0);
+            // Only `[st0, en0]`, as in C: the padding keeps what earlier
+            // anti-diagonals left there.
             for t in st0..=en0 {
-                let sq = sf[t] as usize;
+                let sq = sfqr[t] as usize;
                 let qidx = (qrr_base + t as i32) as usize;
-                let qq = qr[qidx] as usize;
+                let qq = sfqr[tlen_pad + qidx] as usize;
                 s[t] = input.mat[sq * m as usize + qq];
             }
         }
@@ -2561,6 +2877,7 @@ fn extz2_core_traceback_impl<B: BackendOps, const APPROX: bool, const RIGHT: boo
     }
 }
 
+#[inline(always)]
 pub(super) fn extz2_core<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, ws: &mut Workspace) {
     let with_cigar = (input.flag & KSW_EZ_SCORE_ONLY) == 0;
     if !with_cigar {
@@ -2580,6 +2897,140 @@ pub(super) fn extz2_core<B: BackendOps>(input: &Extz2Input<'_>, ez: &mut Extz, w
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lane-wise exact-max update must match `update_h_exact_scalar`
+    /// exactly, ties included (the first position of the maximum wins, and
+    /// `h[en0]` wins unless strictly beaten). Small value ranges force ties.
+    #[test]
+    fn lane_exact_max_matches_scalar() {
+        #[allow(unused_mut)]
+        let mut kernels: Vec<(
+            &str,
+            fn(&mut [i32], &[u8], &[u8], usize, usize, i32) -> (i32, i32),
+        )> = Vec::new();
+        #[cfg(target_arch = "aarch64")]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            kernels.push(("neon", |h, v, u, st0, en0, qe| unsafe {
+                update_h_exact_lanes_neon(h, v, u, st0, en0, qe)
+            }));
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("sse4.1") {
+            kernels.push(("sse4.1", |h, v, u, st0, en0, qe| unsafe {
+                update_h_exact_lanes_sse41(h, v, u, st0, en0, qe)
+            }));
+        }
+        let mut seed = 7u64;
+        let mut next = move |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        for (name, kernel) in kernels {
+            for _ in 0..20_000 {
+                let len = 1 + next(120) as usize;
+                let st0 = next(len as u64) as usize;
+                let en0 = st0 + next((len - st0) as u64) as usize;
+                let span = 1 + next(6) as i32;
+                // `h` and `v` hold whole 4-cell groups, as in a `Workspace`
+                let h0: Vec<i32> = (0..len + 3)
+                    .map(|_| next(span as u64) as i32 - span / 2)
+                    .collect();
+                let v: Vec<u8> = (0..len + 3).map(|_| next(4) as u8).collect();
+                let u: Vec<u8> = (0..len).map(|_| next(4) as u8).collect();
+                let qe = next(4) as i32;
+                let (mut ha, mut hb) = (h0.clone(), h0);
+                let want = update_h_exact_scalar(&mut ha, &v, &u, st0, en0, qe);
+                let got = kernel(&mut hb, &v, &u, st0, en0, qe);
+                assert_eq!((got, &hb), (want, &ha), "{name}: st0={st0} en0={en0}");
+            }
+        }
+    }
+
+    /// Every x86 kernel the CPU supports gives the scalar result, not only
+    /// the one runtime dispatch picks (which hides SSE4.1 behind AVX2).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn each_x86_kernel_matches_scalar() {
+        let mut kernels: Vec<(&str, KernelFn)> = Vec::new();
+        if std::is_x86_feature_detected!("sse4.1") {
+            kernels.push(("sse4.1", extz2_sse41));
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            kernels.push(("avx2", extz2_avx2));
+        }
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 33) % n
+        };
+        let mat = mm_mat(2, -4);
+        let flags = [
+            KSW_EZ_SCORE_ONLY,
+            KSW_EZ_SCORE_ONLY | KSW_EZ_RIGHT,
+            0,
+            KSW_EZ_RIGHT,
+            KSW_EZ_EXTZ_ONLY,
+            KSW_EZ_SCORE_ONLY | KSW_EZ_APPROX_MAX | KSW_EZ_APPROX_DROP,
+            KSW_EZ_GENERIC_SC,
+            KSW_EZ_SCORE_ONLY | KSW_EZ_NO_MAX,
+        ];
+        let (mut ws, mut ws_scalar) = (Workspace::default(), Workspace::default());
+        let (mut got, mut want) = (Extz::default(), Extz::default());
+        for case in 0..10_000 {
+            let ql = 1 + rnd(if case % 50 == 0 { 700 } else { 200 }) as usize;
+            let tl = (ql as i64 + rnd(31) as i64 - 15).max(1) as usize;
+            let t: Vec<u8> = (0..tl).map(|_| rnd(5) as u8).collect();
+            let q: Vec<u8> = (0..ql)
+                .map(|i| {
+                    if i < tl && rnd(8) != 0 {
+                        t[i]
+                    } else {
+                        rnd(5) as u8
+                    }
+                })
+                .collect();
+            let input = Extz2Input {
+                query: &q,
+                target: &t,
+                m: 5,
+                mat: &mat,
+                q: 4 + rnd(4) as i8,
+                e: 1 + rnd(2) as i8,
+                w: [-1, 1, 4, 15, 31][rnd(5) as usize],
+                zdrop: [-1, 30, 100][rnd(3) as usize],
+                end_bonus: 0,
+                flag: flags[rnd(flags.len() as u64) as usize],
+            };
+            extz2_scalar_with_workspace(&input, &mut want, &mut ws_scalar);
+            for &(name, kernel) in &kernels {
+                // SAFETY: the kernel's target feature was detected above.
+                unsafe { kernel(&input, &mut got, &mut ws) };
+                let what = format!(
+                    "{name} case {case}: ql={ql} tl={tl} w={} flag={:#x}",
+                    input.w, input.flag
+                );
+                assert_eq!(
+                    (got.max, got.zdropped, got.max_q, got.max_t),
+                    (want.max, want.zdropped, want.max_q, want.max_t),
+                    "{what}"
+                );
+                assert_eq!(
+                    (got.mqe, got.mqe_t, got.mte, got.mte_q, got.score),
+                    (want.mqe, want.mqe_t, want.mte, want.mte_q, want.score),
+                    "{what}"
+                );
+                assert_eq!(
+                    (got.reach_end, &got.cigar),
+                    (want.reach_end, &want.cigar),
+                    "{what}"
+                );
+            }
+        }
+    }
 
     fn mm_mat(match_score: i8, mismatch_score: i8) -> [i8; 25] {
         let mut mat = [mismatch_score; 25];
