@@ -441,6 +441,21 @@ unsafe fn fill_scores_partial_block_neon<const KEEP_LOW: bool>(
     unsafe { vst1q_s8(sp, tmp) };
 }
 
+/// NEON score fill: writes exactly the cells `[st0, min(end, s.len()))` (see
+/// the notes above `fill_scores_fast_row_scalar`), 16 per store.
+///
+/// Narrow rows (at most two chunks, the banded case) go as in 0.2.1: chunks
+/// from `st0` while `t <= en0`, with no per-row setup. A chunk that would
+/// leave `s` (last rows only) is a masked block instead. Wider rows store the
+/// chunk at `st0`, the one ending at `end`, then the whole 16-cell blocks
+/// between them, so that each block the DP kernel loads is forwarded from a
+/// single store. On Apple cores the per-row instruction count of narrow rows
+/// matters more than that forwarding; on wide rows the aligned blocks win.
+///
+/// # Safety
+/// `st0 <= en0 < s.len()`, `qrr_base + st0 >= 0`, and
+/// `s.len() + qrr_base + en0 + 31 <= sfqr.len()` (as for the x86 fills; the
+/// score-only and traceback cores guarantee it by construction).
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
@@ -458,66 +473,77 @@ unsafe fn fill_scores_fast_row_neon(
     use std::arch::aarch64::*;
 
     let tlen_pad = s.len();
-    let end = st0 + ((en0 - st0) / 16 + 1) * 16;
-    let lim = end.min(tlen_pad);
-    // see `fill_scores_fast_row_avx2`
-    assert!(
+    // the caller guarantees these (see the safety section above)
+    debug_assert!(
         st0 <= en0
             && en0 < tlen_pad
             && qrr_base + st0 as i32 >= 0
             && tlen_pad + (qrr_base + en0 as i32) as usize + 31 <= sfqr.len()
     );
-
-    let mut t = st0 & !15;
-    if t < st0 {
-        // SAFETY: `t < st0 <= en0 < tlen_pad` and the bounds asserted above.
-        unsafe {
-            fill_scores_partial_block_neon::<true>(
-                sfqr,
-                qrr_base,
-                t,
-                st0 - t,
-                wildcard,
-                sc_mch,
-                sc_mis,
-                sc_n,
-                s,
-            )
-        };
-        t += 16;
-    }
     let wc = vdupq_n_u8(wildcard);
     let mch = vdupq_n_s8(sc_mch);
     let mis = vdupq_n_s8(sc_mis);
     let nsc = vdupq_n_s8(sc_n);
-    while t + 16 <= lim {
-        let qpos = (tlen_pad as isize + qrr_base as isize + t as isize) as usize;
-        // SAFETY: `st0 <= t` and `t + 16 <= lim`: all 16 cells are inside
-        // `[st0, end)` and `s`, and the loads inside `sfqr` (asserted above).
-        let sq = unsafe { vld1q_u8(sfqr.as_ptr().add(t)) };
-        let qq = unsafe { vld1q_u8(sfqr.as_ptr().add(qpos)) };
-        let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
-        let eq = vceqq_u8(sq, qq);
-        let tmp = vbslq_s8(eq, mch, mis);
-        let tmp = vbslq_s8(mask_wc, nsc, tmp);
-        unsafe { vst1q_s8(s.as_mut_ptr().add(t), tmp) };
-        t += 16;
-    }
-    if t < lim {
-        // SAFETY: `t` is a multiple of 16 below `lim <= tlen_pad`.
-        unsafe {
-            fill_scores_partial_block_neon::<false>(
-                sfqr,
-                qrr_base,
-                t,
-                end - t,
-                wildcard,
-                sc_mch,
-                sc_mis,
-                sc_n,
-                s,
-            )
+    let sp = s.as_mut_ptr();
+    let tp = sfqr.as_ptr();
+    // `qp + t` is the query cell of target cell `t` (`qrr_base + t >= 0`)
+    let qp = unsafe { sfqr.as_ptr().add(tlen_pad).offset(qrr_base as isize) };
+    // the last 16-cell block of `s` (`tlen_pad` is a nonzero multiple of 16)
+    let last = tlen_pad - 16;
+    let mut t = st0;
+    if en0 - st0 >= 32 && st0 + ((en0 - st0) / 16 + 1) * 16 <= tlen_pad {
+        // A wide row inside `s`: the chunk at `st0`, the one ending at `end`,
+        // then the whole 16-cell blocks between them, each in one store, so
+        // that the DP kernel's load of each block is forwarded from one store
+        // (cells covered twice get the same value twice).
+        let end = st0 + ((en0 - st0) / 16 + 1) * 16;
+        // SAFETY: `st0 <= t` and `t + 16 <= end <= tlen_pad` for each store,
+        // the loads inside `sfqr` (safety section above).
+        let chunk = |t: usize| unsafe {
+            let sq = vld1q_u8(tp.add(t));
+            let qq = vld1q_u8(qp.add(t));
+            let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
+            let tmp = vbslq_s8(vceqq_u8(sq, qq), mch, mis);
+            vst1q_s8(sp.add(t), vbslq_s8(mask_wc, nsc, tmp));
         };
+        chunk(st0);
+        chunk(end - 16);
+        t = (st0 + 16) & !15;
+        while t + 16 < end {
+            chunk(t);
+            t += 16;
+        }
+        return;
+    }
+    while t <= en0 {
+        if t > last {
+            // SAFETY: `last < t <= en0 < tlen_pad`; the cells `[t, tlen_pad)`
+            // are the last ones of the row.
+            unsafe {
+                fill_scores_partial_block_neon::<true>(
+                    sfqr,
+                    qrr_base,
+                    last,
+                    t - last,
+                    wildcard,
+                    sc_mch,
+                    sc_mis,
+                    sc_n,
+                    s,
+                )
+            };
+            break;
+        }
+        // SAFETY: `st0 <= t <= last`: the store is inside `s`, the loads
+        // inside `sfqr` (safety section above).
+        unsafe {
+            let sq = vld1q_u8(tp.add(t));
+            let qq = vld1q_u8(qp.add(t));
+            let mask_wc = vorrq_u8(vceqq_u8(sq, wc), vceqq_u8(qq, wc));
+            let tmp = vbslq_s8(vceqq_u8(sq, qq), mch, mis);
+            vst1q_s8(sp.add(t), vbslq_s8(mask_wc, nsc, tmp));
+        }
+        t += 16;
     }
 }
 
@@ -1165,7 +1191,10 @@ unsafe fn dp_row_traceback_dispatch(
 /// the same order, for [`super::KSW_EZ_NO_MAX`]. A plain widening add: the
 /// compiler vectorizes it well enough that per-backend versions measured no
 /// faster.
-#[inline]
+// On aarch64 the call, and the vector constants it makes the anti-diagonal
+// loop spill and reload, cost NO_MAX 5-8% (measured on an M5 Max).
+#[cfg_attr(target_arch = "aarch64", inline(always))]
+#[cfg_attr(not(target_arch = "aarch64"), inline)]
 fn update_h_no_max(h: &mut [i32], v: &[u8], u: &[u8], st0: usize, en0: usize, qe: i32) {
     if en0 > 0 {
         h[en0] = h[en0 - 1] + i32::from(u[en0]) - qe;
@@ -1378,12 +1407,16 @@ unsafe fn update_h_exact_lanes_sse41(
     }
 }
 
-/// NEON lane-wise exact-max row update: [`update_h_exact_lanes_sse41`], group
-/// for group.
-///
-/// `h` must hold whole groups: `h.len() >= (en0 | 3) + 1`.
+/// NEON lane-wise exact-max row update, lanes anchored at `st0`: whole
+/// 16-cell blocks go four groups at a time into separate accumulators, then
+/// 4-cell groups into accumulator 0, then a scalar tail. Measured faster on
+/// Apple cores than the absolute 4-cell groups of the x86 kernels: the masked
+/// end groups cost more than the store-forwarding they save.
+// NEON is part of the aarch64 baseline: no `target_feature` is needed, and
+// without one the update can be forced inline into the anti-diagonal loop
+// (worth about 6% at w=15: the call made the loop spill its vector constants).
 #[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
+#[inline(always)]
 unsafe fn update_h_exact_lanes_neon(
     h: &mut [i32],
     v: &[u8],
@@ -1392,83 +1425,21 @@ unsafe fn update_h_exact_lanes_neon(
     en0: usize,
     qe: i32,
 ) -> (i32, i32) {
-    use std::arch::aarch64::*;
+    // SAFETY: NEON is always present on aarch64; the memory accesses are
+    // justified where they happen.
+    #[allow(unused_unsafe)]
+    unsafe {
+        use std::arch::aarch64::*;
 
-    let h_en = if en0 > 0 {
-        h[en0 - 1] + i32::from(u[en0]) - qe
-    } else {
-        h[en0] + i32::from(v[en0]) - qe
-    };
-    let lo = st0 & !3;
-    let hi = en0 & !3;
-    assert!(st0 <= en0 && hi + 4 <= h.len() && hi + 4 <= v.len());
-
-    let qe_v = vdupq_n_s32(qe);
-    let lane = unsafe { vld1q_s32([0i32, 1, 2, 3].as_ptr()) };
-    let st_m1 = vdupq_n_s32(st0 as i32 - 1);
-    let en_v = vdupq_n_s32(en0 as i32);
-    let hen_v = vdupq_n_s32(h_en);
-    let mut mx = [vdupq_n_s32(i32::MIN); 4];
-    let mut mt = [vdupq_n_s32(i32::MAX); 4];
-
-    // The four cells of `v` at `g`, widened.
-    macro_rules! v_group {
-        ($g:expr) => {{
-            // SAFETY: the group is inside `v` (asserted above).
-            let v4 = unsafe { (v.as_ptr().add($g) as *const u32).read_unaligned() };
-            vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(
-                vdup_n_u32(v4),
-            )))))
-        }};
-    }
-    // The group at `g` when it holds `st0` or `en0`: the cells in
-    // `[st0, en0)` are updated and enter accumulator 0, `h[en0]` is set, the
-    // others are stored back as they were.
-    macro_rules! masked_group {
-        ($g:expr) => {{
-            let g: usize = $g;
-            // SAFETY: `g <= hi`, so the group is inside `h` and `v` (asserted).
-            let hp = unsafe { h.as_mut_ptr().add(g) };
-            let hv = unsafe { vld1q_s32(hp) };
-            let nh = vsubq_s32(vaddq_s32(hv, v_group!(g)), qe_v);
-            let pos = vaddq_s32(vdupq_n_s32(g as i32), lane);
-            let inside = vandq_u32(vcgtq_s32(pos, st_m1), vcgtq_s32(en_v, pos));
-            let out = vbslq_s32(inside, nh, hv);
-            let out = vbslq_s32(vceqq_s32(pos, en_v), hen_v, out);
-            unsafe { vst1q_s32(hp, out) };
-            let take = vandq_u32(inside, vcgtq_s32(nh, mx[0]));
-            mx[0] = vbslq_s32(take, nh, mx[0]);
-            mt[0] = vbslq_s32(take, pos, mt[0]);
-        }};
-    }
-    // A group wholly inside `[st0, en0)`, into accumulator 0.
-    macro_rules! whole_group {
-        ($g:expr) => {{
-            let g: usize = $g;
-            // SAFETY: `g + 4 <= en0`, within both `h` and `v` (asserted above).
-            let hp = unsafe { h.as_mut_ptr().add(g) };
-            let nh = vsubq_s32(vaddq_s32(unsafe { vld1q_s32(hp) }, v_group!(g)), qe_v);
-            unsafe { vst1q_s32(hp, nh) };
-            let take = vcgtq_s32(nh, mx[0]);
-            mx[0] = vbslq_s32(take, nh, mx[0]);
-            mt[0] = vbslq_s32(take, vaddq_s32(vdupq_n_s32(g as i32), lane), mt[0]);
-        }};
-    }
-
-    let mut g = lo;
-    if g < st0 {
-        masked_group!(g);
-        g += 4;
-    }
-    // Whole groups up to the first whole 16-cell block...
-    while g + 4 <= en0 && (g & 15 != 0 || g + 16 > en0) {
-        whole_group!(g);
-        g += 4;
-    }
-    // ...the whole blocks, four groups at a time...
-    let wide = g + 16 <= en0;
-    if wide {
-        let base = vaddq_s32(vdupq_n_s32(g as i32), lane);
+        let h_en = if en0 > 0 {
+            h[en0 - 1] + i32::from(u[en0]) - qe
+        } else {
+            h[en0] + i32::from(v[en0]) - qe
+        };
+        h[en0] = h_en;
+        let qe_v = vdupq_n_s32(qe);
+        let lane = unsafe { vld1q_s32([0i32, 1, 2, 3].as_ptr()) };
+        let base = vaddq_s32(vdupq_n_s32(st0 as i32), lane);
         let mut idx = [
             base,
             vaddq_s32(base, vdupq_n_s32(4)),
@@ -1476,9 +1447,13 @@ unsafe fn update_h_exact_lanes_neon(
             vaddq_s32(base, vdupq_n_s32(12)),
         ];
         let sixteen = vdupq_n_s32(16);
-        while g + 16 <= en0 {
-            // SAFETY: `g + 16 <= en0`, within both `h` and `v` (asserted above).
-            let vb = unsafe { vld1q_u8(v.as_ptr().add(g)) };
+        let mut mx = [vdupq_n_s32(i32::MIN); 4];
+        let mut mt = [vdupq_n_s32(i32::MAX); 4];
+        let mut t = st0;
+        assert!(en0 <= v.len() && en0 <= h.len());
+        while t + 16 <= en0 {
+            // SAFETY: `t + 16 <= en0`, within both `h` and `v` (asserted above).
+            let vb = unsafe { vld1q_u8(v.as_ptr().add(t)) };
             let (w_lo, w_hi) = (vmovl_u8(vget_low_u8(vb)), vmovl_high_u8(vb));
             let vw = [
                 vmovl_u16(vget_low_u16(w_lo)),
@@ -1487,7 +1462,7 @@ unsafe fn update_h_exact_lanes_neon(
                 vmovl_high_u16(w_hi),
             ];
             for k in 0..4 {
-                let hp = unsafe { h.as_mut_ptr().add(g + 4 * k) };
+                let hp = unsafe { h.as_mut_ptr().add(t + 4 * k) };
                 let nh = vsubq_s32(
                     vaddq_s32(unsafe { vld1q_s32(hp) }, vreinterpretq_s32_u32(vw[k])),
                     qe_v,
@@ -1498,38 +1473,51 @@ unsafe fn update_h_exact_lanes_neon(
                 mt[k] = vbslq_s32(take, idx[k], mt[k]);
                 idx[k] = vaddq_s32(idx[k], sixteen);
             }
-            g += 16;
+            t += 16;
         }
-        // ...and the whole groups after them. Accumulator 0 still sees its
-        // positions in increasing order, so it still keeps the first maximum.
-        while g + 4 <= en0 {
-            whole_group!(g);
-            g += 4;
+        // Then 4 cells at a time into the first accumulator: each lane still
+        // sees its positions in increasing order, so it keeps the first maximum.
+        let mut idx4 = vaddq_s32(vdupq_n_s32(t as i32), lane);
+        while t + 4 <= en0 {
+            // SAFETY: `t + 4 <= en0`, within both `h` and `v` (asserted above).
+            let v4 = unsafe { (v.as_ptr().add(t) as *const u32).read_unaligned() };
+            let vw = vmovl_u16(vget_low_u16(vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(v4)))));
+            let hp = unsafe { h.as_mut_ptr().add(t) };
+            let nh = vsubq_s32(
+                vaddq_s32(unsafe { vld1q_s32(hp) }, vreinterpretq_s32_u32(vw)),
+                qe_v,
+            );
+            unsafe { vst1q_s32(hp, nh) };
+            let take = vcgtq_s32(nh, mx[0]);
+            mx[0] = vbslq_s32(take, nh, mx[0]);
+            mt[0] = vbslq_s32(take, idx4, mt[0]);
+            idx4 = vaddq_s32(idx4, vdupq_n_s32(4));
+            t += 4;
         }
-    }
-    // The group of `en0`, unless it was also the group of `st0`.
-    if g <= hi {
-        masked_group!(g);
-    }
-
-    let none = vdupq_n_s32(i32::MAX);
-    let (best, first);
-    if wide {
-        best = vmaxvq_s32(vmaxq_s32(vmaxq_s32(mx[0], mx[1]), vmaxq_s32(mx[2], mx[3])));
-        let mv = vdupq_n_s32(best);
-        let mut f = none;
-        for k in 0..4 {
-            f = vminq_s32(f, vbslq_s32(vceqq_s32(mx[k], mv), mt[k], none));
+        let (mut best, mut best_t) = (i32::MIN, i32::MAX);
+        if t > st0 {
+            best = vmaxvq_s32(vmaxq_s32(vmaxq_s32(mx[0], mx[1]), vmaxq_s32(mx[2], mx[3])));
+            let mv = vdupq_n_s32(best);
+            let none = vdupq_n_s32(i32::MAX);
+            let mut first = none;
+            for k in 0..4 {
+                first = vminq_s32(first, vbslq_s32(vceqq_s32(mx[k], mv), mt[k], none));
+            }
+            best_t = vminvq_s32(first);
         }
-        first = f;
-    } else {
-        best = vmaxvq_s32(mx[0]);
-        first = vbslq_s32(vceqq_s32(mx[0], vdupq_n_s32(best)), mt[0], none);
-    }
-    if best > h_en {
-        (best, vminvq_s32(first))
-    } else {
-        (h_en, en0 as i32)
+        // The tail follows every position above, so strict `>` keeps them first.
+        for k in t..en0 {
+            h[k] += i32::from(v[k]) - qe;
+            if h[k] > best {
+                best = h[k];
+                best_t = k as i32;
+            }
+        }
+        if best > h_en {
+            (best, best_t)
+        } else {
+            (h_en, en0 as i32)
+        }
     }
 }
 
