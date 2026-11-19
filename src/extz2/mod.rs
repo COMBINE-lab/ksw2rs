@@ -125,13 +125,13 @@ pub struct Extz2Input<'a> {
 ///
 /// The seven byte-sized DP arrays (u, v, x, y, s, sf, qr) are packed into a
 /// single contiguous allocation (`buf`) in the same layout that the C reference
-/// uses: `[u | v | x | y | s | sf | qr+32_pad]`.  This gives better cache and
+/// uses: `[u | v | x | y | s+16 | sf | qr+32_pad]`.  This gives better cache and
 /// TLB behaviour than seven separate `Vec` allocations, and the 32-byte
 /// overshoot beyond `qr` means the SIMD score-fill kernels never need a
 /// per-chunk bounds check.
 #[derive(Debug, Default, Clone)]
 pub struct Workspace {
-    /// Flat buffer: `6 * tlen_pad + qlen_pad + 32` bytes, zeroed on resize.
+    /// Flat buffer: `6 * tlen_pad + 16 + qlen_pad + 32` bytes, zeroed on resize.
     buf: Vec<u8>,
     /// Exact-path scores, `tlen` cells plus padding to a whole 4-cell group.
     h: Vec<i32>,
@@ -148,7 +148,7 @@ pub struct Workspace {
 impl Workspace {
     /// Prepare the flat buffer for a score-only alignment.
     ///
-    /// Layout: `[u | v | x | y | s | sf | qr+32]`, all zero-initialised once.
+    /// Layout: `[u | v | x | y | s+16 | sf | qr+32]`, all zero-initialised once.
     /// The trailing 32-byte pad on `qr` (and the implicit pad provided by `qr`
     /// after `sf`) means SIMD score-fill kernels can always load whole blocks
     /// without a per-chunk bounds check.
@@ -156,8 +156,9 @@ impl Workspace {
     fn prepare_score_only(&mut self, qlen: usize, tlen: usize, approx: bool) {
         let tlen_pad = tlen.div_ceil(16) * 16;
         let qlen_pad = qlen.div_ceil(16) * 16;
-        // 6 tlen_pad-wide arrays (u,v,x,y,s,sf) plus qr with a 32-byte pad.
-        let total = 6 * tlen_pad + qlen_pad + 32;
+        // 6 tlen_pad-wide arrays (u,v,x,y,s,sf), the slack after s, and qr
+        // with a 32-byte pad.
+        let total = 6 * tlen_pad + core::S_SLACK + qlen_pad + 32;
         self.buf.clear();
         self.buf.resize(total, 0u8);
         self.tlen_pad = tlen_pad;
